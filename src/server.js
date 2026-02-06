@@ -600,31 +600,6 @@ Commands:
 /help  - how to use
 /status - check bot`;
 
-  const helpText =
-`🧠 How to use
-
-1) Send a file with optional caption:
-   • "to pdf", "to docx", "to xlsx", "to txt", "to json", "to csv"
-
-2) Supported conversions (examples):
-   • Excel → PDF / CSV / JSON
-   • PDF → Excel / TXT / DOCX / Images (zip)
-   • DOCX / PPTX / TXT → PDF
-   • CSV ↔ JSON, CSV → XLSX
-   • JSON → CSV / XLSX
-   • Image → PDF
-
-3) File limit:
-   • Max ${MAX_MB} MB
-
-If something fails:
-• Try a smaller file
-• Check that the target format is supported`;
-
-  bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, startText));
-  bot.onText(/\/help/, (msg) => bot.sendMessage(msg.chat.id, helpText));
-  bot.onText(/\/status/, (msg) => bot.sendMessage(msg.chat.id, "✅ Bot is running and ready. Send a file."));
-
   function parseTarget(caption) {
     if (!caption) return null;
     const match = caption.match(/(?:^|\s)(?:to|convert\s+to|\/to)[:\s]+([a-z0-9]+)/i);
@@ -738,39 +713,69 @@ If something fails:
         await imageToPdf(input, outPath);
         return outPath;
       }}
+    },
+    ".bmp": {
+      pdf: { label: "Image → PDF", outputExt: ".pdf", convert: async (input, dir) => {
+        const outPath = path.join(dir, "output.pdf");
+        await imageToPdf(input, outPath);
+        return outPath;
+      }}
     }
   };
 
-  bot.on("document", async (msg) => {
-    const chatId = msg.chat.id;
-    const doc = msg.document;
+  const pendingConversions = new Map();
 
-    const fileName = doc.file_name || "file";
-    const ext = path.extname(fileName).toLowerCase();
-    const target = parseTarget(msg.caption);
+  function formatSupportedConversions(conversions) {
+    const lines = [];
+    const groups = Object.entries(conversions).map(([ext, targets]) => {
+      const targetList = Object.values(targets)
+        .map(target => target.label.split("→")[1]?.trim() || target.outputExt.replace(".", "").toUpperCase())
+        .filter(Boolean);
+      return { ext, targetList };
+    });
 
-    // Telegram gives file size too
-    const size = doc.file_size || 0;
-    if (size > MAX_BYTES) {
-      return bot.sendMessage(chatId, `❌ File too large. Max allowed is ${MAX_MB} MB.`);
+    for (const group of groups) {
+      const from = group.ext.replace(".", "").toUpperCase();
+      const targets = Array.from(new Set(group.targetList));
+      if (targets.length === 0) continue;
+      lines.push(`• ${from} → ${targets.join(" / ")}`);
     }
+    return lines.join("\n");
+  }
 
-    const options = telegramConversions[ext] || {};
-    const defaultTarget = Object.keys(options)[0];
-    const resolvedTarget = target || defaultTarget;
-    const conversion = resolvedTarget ? options[resolvedTarget] : null;
-
-    if (!conversion) {
-      const supportedTargets = Object.keys(options);
-      if (supportedTargets.length === 0) {
-        return bot.sendMessage(chatId, "❌ Unsupported file type. Send a supported file (PDF, DOCX, PPTX, XLSX, CSV, JSON, TXT, JPG/PNG).");
-      }
-      return bot.sendMessage(
-        chatId,
-        `❌ Unsupported target. Try: ${supportedTargets.map(t => `"to ${t}"`).join(", ")}.`
-      );
+  function buildTargetKeyboard(options, token) {
+    const targets = Object.keys(options);
+    const rows = [];
+    for (let i = 0; i < targets.length; i += 2) {
+      const row = targets.slice(i, i + 2).map(target => ({
+        text: options[target].label,
+        callback_data: `conv:${token}:${target}`
+      }));
+      rows.push(row);
     }
+    return { inline_keyboard: rows };
+  }
 
+  const helpText =
+`🧠 How to use
+
+1) Send a file with an optional caption:
+   • "to pdf", "to docx", "to xlsx", "to txt", "to json", "to csv"
+
+2) Supported conversions:
+${formatSupportedConversions(telegramConversions)}
+
+3) File limit:
+   • Max ${MAX_MB} MB
+
+Pro tip:
+• If you skip the caption, I'll show smart buttons for possible targets.`;
+
+  bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, startText));
+  bot.onText(/\/help/, (msg) => bot.sendMessage(msg.chat.id, helpText));
+  bot.onText(/\/status/, (msg) => bot.sendMessage(msg.chat.id, "✅ Bot is running and ready. Send a file."));
+
+  async function performConversion({ chatId, conversion, fileId, ext, resolvedTarget }) {
     const status = await bot.sendMessage(chatId, `⏳ Received: *${conversion.label}*\nDownloading...`, {
       parse_mode: "Markdown"
     });
@@ -779,8 +784,7 @@ If something fails:
     const outputPath = path.join(os.tmpdir(), randName(conversion.outputExt));
 
     try {
-      // Download file from Telegram
-      const downloadedPath = await bot.downloadFile(doc.file_id, workDir);
+      const downloadedPath = await bot.downloadFile(fileId, workDir);
 
       await bot.editMessageText(`⚙️ Converting: *${conversion.label}*\nPlease wait...`, {
         chat_id: chatId,
@@ -797,7 +801,6 @@ If something fails:
         parse_mode: "Markdown"
       });
 
-      // Send result file back
       await bot.sendDocument(chatId, outputPath, {
         caption: `✅ ${conversion.label}`
       });
@@ -805,13 +808,86 @@ If something fails:
       if (resolvedTarget === "xlsx" && ext === ".pdf") {
         await bot.sendMessage(chatId, "Tip: If this PDF was scanned, results can be messy. Send a text-based PDF for best tables.");
       }
-
     } catch (e) {
       await bot.sendMessage(chatId, `❌ Conversion failed.\nReason: ${e.message}`);
     } finally {
       await safeUnlink(outputPath);
       await safeRmDir(workDir);
     }
+  }
+
+  bot.on("document", async (msg) => {
+    const chatId = msg.chat.id;
+    const doc = msg.document;
+
+    const fileName = doc.file_name || "file";
+    const ext = path.extname(fileName).toLowerCase();
+    const target = parseTarget(msg.caption);
+
+    // Telegram gives file size too
+    const size = doc.file_size || 0;
+    if (size > MAX_BYTES) {
+      return bot.sendMessage(chatId, `❌ File too large. Max allowed is ${MAX_MB} MB.`);
+    }
+
+    const options = telegramConversions[ext] || {};
+    const supportedTargets = Object.keys(options);
+    if (supportedTargets.length === 0) {
+      return bot.sendMessage(chatId, "❌ Unsupported file type. Send a supported file (PDF, DOCX, PPTX, XLSX, CSV, JSON, TXT, JPG/PNG/BMP).");
+    }
+
+    if (!target) {
+      const token = crypto.randomBytes(6).toString("hex");
+      pendingConversions.set(token, { fileId: doc.file_id, ext, fileName, chatId });
+      setTimeout(() => pendingConversions.delete(token), 10 * 60 * 1000);
+      return bot.sendMessage(chatId, `✅ Detected *${fileName}*.\nChoose a conversion:`, {
+        parse_mode: "Markdown",
+        reply_markup: buildTargetKeyboard(options, token)
+      });
+    }
+
+    const conversion = options[target];
+    if (!conversion) {
+      const token = crypto.randomBytes(6).toString("hex");
+      pendingConversions.set(token, { fileId: doc.file_id, ext, fileName, chatId });
+      setTimeout(() => pendingConversions.delete(token), 10 * 60 * 1000);
+      return bot.sendMessage(
+        chatId,
+        `❌ Unsupported target "${target}". Pick from the buttons below:`,
+        { reply_markup: buildTargetKeyboard(options, token) }
+      );
+    }
+
+    await performConversion({ chatId, conversion, fileId: doc.file_id, ext, resolvedTarget: target });
+  });
+
+  bot.on("callback_query", async (query) => {
+    const data = query.data || "";
+    if (!data.startsWith("conv:")) return;
+
+    const [, token, target] = data.split(":");
+    const pending = pendingConversions.get(token);
+    if (!pending) {
+      await bot.answerCallbackQuery(query.id, { text: "This request expired. Please send the file again." });
+      return;
+    }
+
+    const options = telegramConversions[pending.ext] || {};
+    const conversion = options[target];
+    if (!conversion) {
+      await bot.answerCallbackQuery(query.id, { text: "That conversion is no longer available." });
+      return;
+    }
+
+    pendingConversions.delete(token);
+    await bot.answerCallbackQuery(query.id, { text: `Starting ${conversion.label}...` });
+    await performConversion({
+      chatId: pending.chatId,
+      conversion,
+      fileId: pending.fileId,
+      ext: pending.ext,
+      resolvedTarget: target
+    });
   });
 
   console.log("Telegram bot started (polling).");
