@@ -3,11 +3,13 @@ import multer from "multer";
 import os from "os";
 import path from "path";
 import fs from "fs/promises";
-import { createReadStream } from "fs";
+import { createReadStream, createWriteStream } from "fs";
 import { spawn } from "child_process";
 import crypto from "crypto";
 import XLSX from "xlsx";
 import TelegramBot from "node-telegram-bot-api";
+import pdfParse from "pdf-parse";
+import PDFDocument from "pdfkit";
 
 /* =========================
    CONFIG
@@ -74,67 +76,132 @@ function runCommand(cmd, args, options = {}) {
   });
 }
 
+function commandAvailable(cmd) {
+  return new Promise((resolve) => {
+    const probe = spawn("which", [cmd]);
+    probe.on("error", () => resolve(false));
+    probe.on("close", (code) => resolve(code === 0));
+  });
+}
+
+async function writeTextPdf(lines, outputPath) {
+  await new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ margin: 36 });
+    const stream = createWriteStream(outputPath);
+
+    doc.on("error", reject);
+    stream.on("error", reject);
+    stream.on("finish", resolve);
+
+    doc.pipe(stream);
+    const safeLines = lines.length ? lines : [""];
+    safeLines.forEach((line) => {
+      doc.text(line, { width: 520 });
+      doc.moveDown(0.5);
+    });
+    doc.end();
+  });
+}
+
 /* =========================
    CONVERTERS
 ========================= */
 
-// Excel -> PDF (LibreOffice)
-function convertExcelToPdf(inputPath, outDir) {
-  return new Promise((resolve, reject) => {
-    const args = [
-      "--headless",
-      "--nologo",
-      "--nofirststartwizard",
-      "--nodefault",
-      "--norestore",
-      "--invisible",
-      "--convert-to",
-      "pdf:calc_pdf_Export",
-      "--outdir",
-      outDir,
-      inputPath
-    ];
+// Excel -> PDF (LibreOffice with JS fallback)
+async function convertExcelToPdf(inputPath, outDir) {
+  const base = path.parse(inputPath).name;
+  const outputPath = path.join(outDir, `${base}.pdf`);
+  const args = [
+    "--headless",
+    "--nologo",
+    "--nofirststartwizard",
+    "--nodefault",
+    "--norestore",
+    "--invisible",
+    "--convert-to",
+    "pdf:calc_pdf_Export",
+    "--outdir",
+    outDir,
+    inputPath
+  ];
 
-    runCommand("soffice", args).then(() => resolve()).catch(reject);
-  });
+  if (await commandAvailable("soffice")) {
+    try {
+      await runCommand("soffice", args);
+      await fs.access(outputPath);
+      return outputPath;
+    } catch {
+      // Fall through to JS renderer
+    }
+  }
+
+  await xlsxToPdf(inputPath, outputPath);
+  return outputPath;
+}
+
+async function xlsxToPdf(inputPath, outputPath) {
+  const wb = XLSX.readFile(inputPath);
+  const first = wb.SheetNames[0];
+  const rows = XLSX.utils.sheet_to_json(wb.Sheets[first], { header: 1, defval: "" });
+  const lines = rows.map((row) => row.join("  |  "));
+  await writeTextPdf(lines.length ? lines : ["(empty sheet)"], outputPath);
 }
 
 // PDF -> CSV (Tabula)
-function tabulaPdfToCsv(pdfPath, outCsvPath, pages = "all") {
-  return new Promise((resolve, reject) => {
-    const jar = process.env.TABULA_JAR || "/opt/tabula/tabula.jar";
-    const args = ["-jar", jar, "-p", pages, "-f", "CSV", "-o", outCsvPath, pdfPath];
+async function tabulaPdfToCsv(pdfPath, outCsvPath, pages = "all") {
+  const jar = process.env.TABULA_JAR || "/opt/tabula/tabula.jar";
+  const args = ["-jar", jar, "-p", pages, "-f", "CSV", "-o", outCsvPath, pdfPath];
 
-    runCommand("java", args).then(() => resolve()).catch(reject);
-  });
+  if (await commandAvailable("java")) {
+    try {
+      await fs.access(jar);
+      await runCommand("java", args);
+      return;
+    } catch {
+      // Fall through to JS fallback
+    }
+  }
+
+  const raw = await fs.readFile(pdfPath);
+  const parsed = await pdfParse(raw);
+  const lines = parsed.text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const csvLines = ["text", ...lines.map((line) => `"${line.replace(/"/g, '""')}"`)];
+  await fs.writeFile(outCsvPath, csvLines.join("\n"));
 }
 
-function libreOfficeConvert(inputPath, outDir, target, filter = "") {
-  return new Promise((resolve, reject) => {
-    const targetArg = filter ? `${target}:${filter}` : target;
-    const args = [
-      "--headless",
-      "--nologo",
-      "--nofirststartwizard",
-      "--nodefault",
-      "--norestore",
-      "--invisible",
-      "--convert-to",
-      targetArg,
-      "--outdir",
-      outDir,
-      inputPath
-    ];
+async function libreOfficeConvert(inputPath, outDir, target, filter = "") {
+  const targetArg = filter ? `${target}:${filter}` : target;
+  const args = [
+    "--headless",
+    "--nologo",
+    "--nofirststartwizard",
+    "--nodefault",
+    "--norestore",
+    "--invisible",
+    "--convert-to",
+    targetArg,
+    "--outdir",
+    outDir,
+    inputPath
+  ];
 
-    runCommand("soffice", args)
-      .then(async () => {
-        const base = path.parse(inputPath).name;
-        const outPath = path.join(outDir, `${base}.${target}`);
-        await fs.access(outPath);
-        resolve(outPath);
-      })
-      .catch(reject);
-  });
+  const base = path.parse(inputPath).name;
+  const outPath = path.join(outDir, `${base}.${target}`);
+
+  if (await commandAvailable("soffice")) {
+    await runCommand("soffice", args);
+    await fs.access(outPath);
+    return outPath;
+  }
+
+  if (target === "pdf" && path.extname(inputPath).toLowerCase() === ".txt") {
+    const text = await fs.readFile(inputPath, "utf8");
+    const lines = text.split(/\r?\n/);
+    await writeTextPdf(lines, outPath);
+    return outPath;
+  }
+
+  throw new Error("soffice is not installed or not in PATH");
 }
 
 // CSV -> XLSX (with quotes support)
@@ -250,7 +317,18 @@ async function xlsxToJson(xlsxPath, jsonPath) {
 }
 
 async function pdfToText(pdfPath, txtPath) {
-  await runCommand("pdftotext", [pdfPath, txtPath]);
+  if (await commandAvailable("pdftotext")) {
+    try {
+      await runCommand("pdftotext", [pdfPath, txtPath]);
+      return;
+    } catch {
+      // Fall through to JS fallback
+    }
+  }
+
+  const raw = await fs.readFile(pdfPath);
+  const parsed = await pdfParse(raw);
+  await fs.writeFile(txtPath, parsed.text || "");
 }
 
 async function pdfToImagesZip(pdfPath, zipPath, workDir) {
@@ -336,9 +414,7 @@ app.post("/excel-to-pdf", upload.single("file"), async (req, res) => {
   const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "x2p-"));
 
   try {
-    await convertExcelToPdf(inputPath, workDir);
-    const base = path.parse(inputPath).name;
-    const pdfPath = path.join(workDir, `${base}.pdf`);
+    const pdfPath = await convertExcelToPdf(inputPath, workDir);
     await fs.access(pdfPath);
 
     res.setHeader("Content-Type", "application/pdf");
@@ -608,7 +684,7 @@ Commands:
 
   const telegramConversions = {
     ".xlsx": {
-      pdf: { label: "Excel → PDF", outputExt: ".pdf", convert: (input, dir) => libreOfficeConvert(input, dir, "pdf") },
+      pdf: { label: "Excel → PDF", outputExt: ".pdf", convert: (input, dir) => convertExcelToPdf(input, dir) },
       csv: { label: "Excel → CSV", outputExt: ".csv", convert: async (input, dir) => {
         const outPath = path.join(dir, "output.csv");
         await xlsxToCsv(input, outPath);
@@ -621,7 +697,7 @@ Commands:
       }}
     },
     ".xls": {
-      pdf: { label: "Excel → PDF", outputExt: ".pdf", convert: (input, dir) => libreOfficeConvert(input, dir, "pdf") },
+      pdf: { label: "Excel → PDF", outputExt: ".pdf", convert: (input, dir) => convertExcelToPdf(input, dir) },
       csv: { label: "Excel → CSV", outputExt: ".csv", convert: async (input, dir) => {
         const outPath = path.join(dir, "output.csv");
         await xlsxToCsv(input, outPath);
