@@ -50,6 +50,30 @@ async function safeRmDir(dir) {
   } catch {}
 }
 
+function runCommand(cmd, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], ...options });
+    let stderr = "";
+    let stdout = "";
+
+    if (p.stdout) p.stdout.on("data", d => (stdout += d.toString()));
+    if (p.stderr) p.stderr.on("data", d => (stderr += d.toString()));
+
+    p.on("error", (err) => {
+      if (err.code === "ENOENT") {
+        return reject(new Error(`${cmd} is not installed or not in PATH`));
+      }
+      return reject(err);
+    });
+    p.on("close", (code) => {
+      if (code !== 0) {
+        return reject(new Error(`${cmd} failed: ${stderr || stdout}`));
+      }
+      return resolve({ stdout, stderr });
+    });
+  });
+}
+
 /* =========================
    CONVERTERS
 ========================= */
@@ -71,15 +95,7 @@ function convertExcelToPdf(inputPath, outDir) {
       inputPath
     ];
 
-    const p = spawn("soffice", args, { stdio: ["ignore", "pipe", "pipe"] });
-
-    let err = "";
-    p.stderr.on("data", d => (err += d.toString()));
-    p.on("error", reject);
-    p.on("close", code => {
-      if (code !== 0) return reject(new Error(`LibreOffice failed: ${err}`));
-      resolve();
-    });
+    runCommand("soffice", args).then(() => resolve()).catch(reject);
   });
 }
 
@@ -89,15 +105,35 @@ function tabulaPdfToCsv(pdfPath, outCsvPath, pages = "all") {
     const jar = process.env.TABULA_JAR || "/opt/tabula/tabula.jar";
     const args = ["-jar", jar, "-p", pages, "-f", "CSV", "-o", outCsvPath, pdfPath];
 
-    const p = spawn("java", args, { stdio: ["ignore", "pipe", "pipe"] });
+    runCommand("java", args).then(() => resolve()).catch(reject);
+  });
+}
 
-    let err = "";
-    p.stderr.on("data", d => (err += d.toString()));
-    p.on("error", reject);
-    p.on("close", code => {
-      if (code !== 0) return reject(new Error(`Tabula failed: ${err}`));
-      resolve();
-    });
+function libreOfficeConvert(inputPath, outDir, target, filter = "") {
+  return new Promise((resolve, reject) => {
+    const targetArg = filter ? `${target}:${filter}` : target;
+    const args = [
+      "--headless",
+      "--nologo",
+      "--nofirststartwizard",
+      "--nodefault",
+      "--norestore",
+      "--invisible",
+      "--convert-to",
+      targetArg,
+      "--outdir",
+      outDir,
+      inputPath
+    ];
+
+    runCommand("soffice", args)
+      .then(async () => {
+        const base = path.parse(inputPath).name;
+        const outPath = path.join(outDir, `${base}.${target}`);
+        await fs.access(outPath);
+        resolve(outPath);
+      })
+      .catch(reject);
   });
 }
 
@@ -144,6 +180,94 @@ async function csvToXlsx(csvPath, xlsxPath) {
   XLSX.writeFile(wb, xlsxPath);
 }
 
+async function xlsxToCsv(xlsxPath, csvPath) {
+  const wb = XLSX.readFile(xlsxPath);
+  const first = wb.SheetNames[0];
+  const csv = XLSX.utils.sheet_to_csv(wb.Sheets[first]);
+  await fs.writeFile(csvPath, csv);
+}
+
+async function csvToJson(csvPath, jsonPath) {
+  const text = await fs.readFile(csvPath, "utf8");
+  const lines = text.split(/\r?\n/).filter(l => l.trim().length > 0);
+  if (lines.length === 0) {
+    await fs.writeFile(jsonPath, "[]");
+    return;
+  }
+
+  const headers = parseCsvLine(lines[0]).map(h => h.trim());
+  const rows = lines.slice(1).map(line => parseCsvLine(line));
+  const data = rows.map(row => {
+    const obj = {};
+    headers.forEach((h, idx) => {
+      obj[h] = row[idx] ?? "";
+    });
+    return obj;
+  });
+
+  await fs.writeFile(jsonPath, JSON.stringify(data, null, 2));
+}
+
+function normalizeJsonArray(jsonValue) {
+  if (Array.isArray(jsonValue)) return jsonValue;
+  if (jsonValue && typeof jsonValue === "object") return [jsonValue];
+  return [];
+}
+
+async function jsonToCsv(jsonPath, csvPath) {
+  const raw = await fs.readFile(jsonPath, "utf8");
+  const data = normalizeJsonArray(JSON.parse(raw));
+  const keys = Array.from(new Set(data.flatMap(row => Object.keys(row || {}))));
+
+  const lines = [];
+  lines.push(keys.join(","));
+  for (const row of data) {
+    const values = keys.map(key => {
+      const value = row?.[key] ?? "";
+      const str = String(value).replace(/"/g, '""');
+      return str.includes(",") || str.includes("\n") ? `"${str}"` : str;
+    });
+    lines.push(values.join(","));
+  }
+
+  await fs.writeFile(csvPath, lines.join("\n"));
+}
+
+async function jsonToXlsx(jsonPath, xlsxPath) {
+  const raw = await fs.readFile(jsonPath, "utf8");
+  const data = normalizeJsonArray(JSON.parse(raw));
+  const ws = XLSX.utils.json_to_sheet(data);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Data");
+  XLSX.writeFile(wb, xlsxPath);
+}
+
+async function xlsxToJson(xlsxPath, jsonPath) {
+  const wb = XLSX.readFile(xlsxPath);
+  const first = wb.SheetNames[0];
+  const json = XLSX.utils.sheet_to_json(wb.Sheets[first], { defval: "" });
+  await fs.writeFile(jsonPath, JSON.stringify(json, null, 2));
+}
+
+async function pdfToText(pdfPath, txtPath) {
+  await runCommand("pdftotext", [pdfPath, txtPath]);
+}
+
+async function pdfToImagesZip(pdfPath, zipPath, workDir) {
+  const prefix = path.join(workDir, "page");
+  await runCommand("pdftoppm", ["-png", pdfPath, prefix]);
+  await runCommand("zip", ["-j", zipPath, `${prefix}-*.png`], { shell: true });
+}
+
+async function imageToPdf(imagePath, pdfPath) {
+  try {
+    await runCommand("magick", [imagePath, pdfPath]);
+  } catch (err) {
+    if (!err.message.includes("magick")) throw err;
+    await runCommand("convert", [imagePath, pdfPath]);
+  }
+}
+
 /* =========================
    EXPRESS API
 ========================= */
@@ -153,11 +277,51 @@ app.get("/", (req, res) => {
     service: "Converter API + Telegram Bot",
     endpoints: {
       excel_to_pdf: "POST /excel-to-pdf (form-data key: file)",
-      pdf_to_excel: "POST /pdf-to-excel?pages=all (form-data key: file)"
+      pdf_to_excel: "POST /pdf-to-excel?pages=all (form-data key: file)",
+      pdf_to_txt: "POST /pdf-to-txt (form-data key: file)",
+      txt_to_pdf: "POST /txt-to-pdf (form-data key: file)",
+      docx_to_pdf: "POST /docx-to-pdf (form-data key: file)",
+      pdf_to_docx: "POST /pdf-to-docx (form-data key: file)",
+      pptx_to_pdf: "POST /pptx-to-pdf (form-data key: file)",
+      csv_to_xlsx: "POST /csv-to-xlsx (form-data key: file)",
+      xlsx_to_csv: "POST /xlsx-to-csv (form-data key: file)",
+      csv_to_json: "POST /csv-to-json (form-data key: file)",
+      json_to_csv: "POST /json-to-csv (form-data key: file)",
+      xlsx_to_json: "POST /xlsx-to-json (form-data key: file)",
+      json_to_xlsx: "POST /json-to-xlsx (form-data key: file)",
+      pdf_to_images: "POST /pdf-to-images (form-data key: file)",
+      image_to_pdf: "POST /image-to-pdf (form-data key: file)"
     },
     limits: { max_upload_mb: MAX_MB }
   });
 });
+
+async function handleFileConversion(req, res, options) {
+  const inputPath = req.file?.path;
+  if (!inputPath) return res.status(400).json({ ok: false, error: "Upload file using key: file" });
+
+  const ext = path.extname(req.file.originalname || "").toLowerCase();
+  if (options.allowedExts && !options.allowedExts.includes(ext)) {
+    await safeUnlink(inputPath);
+    return res.status(400).json({ ok: false, error: options.invalidExtMessage });
+  }
+
+  const workDir = await fs.mkdtemp(path.join(os.tmpdir(), options.workPrefix || "conv-"));
+  try {
+    const outputPath = await options.convert(inputPath, workDir);
+    res.setHeader("Content-Type", options.contentType);
+    res.setHeader("Content-Disposition", `attachment; filename="${options.outputName}"`);
+    createReadStream(outputPath).pipe(res);
+    res.on("finish", async () => {
+      await safeUnlink(inputPath);
+      await safeRmDir(workDir);
+    });
+  } catch (e) {
+    await safeUnlink(inputPath);
+    await safeRmDir(workDir);
+    res.status(500).json({ ok: false, error: e.message || "Conversion failed" });
+  }
+}
 
 app.post("/excel-to-pdf", upload.single("file"), async (req, res) => {
   const inputPath = req.file?.path;
@@ -229,6 +393,185 @@ app.post("/pdf-to-excel", upload.single("file"), async (req, res) => {
   }
 });
 
+app.post("/pdf-to-txt", upload.single("file"), async (req, res) => {
+  await handleFileConversion(req, res, {
+    allowedExts: [".pdf"],
+    invalidExtMessage: "Only .pdf allowed",
+    workPrefix: "p2t-",
+    contentType: "text/plain",
+    outputName: "output.txt",
+    convert: async (inputPath, workDir) => {
+      const outPath = path.join(workDir, "output.txt");
+      await pdfToText(inputPath, outPath);
+      return outPath;
+    }
+  });
+});
+
+app.post("/txt-to-pdf", upload.single("file"), async (req, res) => {
+  await handleFileConversion(req, res, {
+    allowedExts: [".txt"],
+    invalidExtMessage: "Only .txt allowed",
+    workPrefix: "t2p-",
+    contentType: "application/pdf",
+    outputName: "output.pdf",
+    convert: async (inputPath, workDir) => libreOfficeConvert(inputPath, workDir, "pdf")
+  });
+});
+
+app.post("/docx-to-pdf", upload.single("file"), async (req, res) => {
+  await handleFileConversion(req, res, {
+    allowedExts: [".docx"],
+    invalidExtMessage: "Only .docx allowed",
+    workPrefix: "d2p-",
+    contentType: "application/pdf",
+    outputName: "output.pdf",
+    convert: async (inputPath, workDir) => libreOfficeConvert(inputPath, workDir, "pdf")
+  });
+});
+
+app.post("/pdf-to-docx", upload.single("file"), async (req, res) => {
+  await handleFileConversion(req, res, {
+    allowedExts: [".pdf"],
+    invalidExtMessage: "Only .pdf allowed",
+    workPrefix: "p2d-",
+    contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    outputName: "output.docx",
+    convert: async (inputPath, workDir) => libreOfficeConvert(inputPath, workDir, "docx")
+  });
+});
+
+app.post("/pptx-to-pdf", upload.single("file"), async (req, res) => {
+  await handleFileConversion(req, res, {
+    allowedExts: [".pptx"],
+    invalidExtMessage: "Only .pptx allowed",
+    workPrefix: "p2p-",
+    contentType: "application/pdf",
+    outputName: "output.pdf",
+    convert: async (inputPath, workDir) => libreOfficeConvert(inputPath, workDir, "pdf")
+  });
+});
+
+app.post("/csv-to-xlsx", upload.single("file"), async (req, res) => {
+  await handleFileConversion(req, res, {
+    allowedExts: [".csv"],
+    invalidExtMessage: "Only .csv allowed",
+    workPrefix: "c2x-",
+    contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    outputName: "output.xlsx",
+    convert: async (inputPath, workDir) => {
+      const outPath = path.join(workDir, "output.xlsx");
+      await csvToXlsx(inputPath, outPath);
+      return outPath;
+    }
+  });
+});
+
+app.post("/xlsx-to-csv", upload.single("file"), async (req, res) => {
+  await handleFileConversion(req, res, {
+    allowedExts: [".xlsx", ".xls"],
+    invalidExtMessage: "Only .xlsx or .xls allowed",
+    workPrefix: "x2c-",
+    contentType: "text/csv",
+    outputName: "output.csv",
+    convert: async (inputPath, workDir) => {
+      const outPath = path.join(workDir, "output.csv");
+      await xlsxToCsv(inputPath, outPath);
+      return outPath;
+    }
+  });
+});
+
+app.post("/csv-to-json", upload.single("file"), async (req, res) => {
+  await handleFileConversion(req, res, {
+    allowedExts: [".csv"],
+    invalidExtMessage: "Only .csv allowed",
+    workPrefix: "c2j-",
+    contentType: "application/json",
+    outputName: "output.json",
+    convert: async (inputPath, workDir) => {
+      const outPath = path.join(workDir, "output.json");
+      await csvToJson(inputPath, outPath);
+      return outPath;
+    }
+  });
+});
+
+app.post("/json-to-csv", upload.single("file"), async (req, res) => {
+  await handleFileConversion(req, res, {
+    allowedExts: [".json"],
+    invalidExtMessage: "Only .json allowed",
+    workPrefix: "j2c-",
+    contentType: "text/csv",
+    outputName: "output.csv",
+    convert: async (inputPath, workDir) => {
+      const outPath = path.join(workDir, "output.csv");
+      await jsonToCsv(inputPath, outPath);
+      return outPath;
+    }
+  });
+});
+
+app.post("/xlsx-to-json", upload.single("file"), async (req, res) => {
+  await handleFileConversion(req, res, {
+    allowedExts: [".xlsx", ".xls"],
+    invalidExtMessage: "Only .xlsx or .xls allowed",
+    workPrefix: "x2j-",
+    contentType: "application/json",
+    outputName: "output.json",
+    convert: async (inputPath, workDir) => {
+      const outPath = path.join(workDir, "output.json");
+      await xlsxToJson(inputPath, outPath);
+      return outPath;
+    }
+  });
+});
+
+app.post("/json-to-xlsx", upload.single("file"), async (req, res) => {
+  await handleFileConversion(req, res, {
+    allowedExts: [".json"],
+    invalidExtMessage: "Only .json allowed",
+    workPrefix: "j2x-",
+    contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    outputName: "output.xlsx",
+    convert: async (inputPath, workDir) => {
+      const outPath = path.join(workDir, "output.xlsx");
+      await jsonToXlsx(inputPath, outPath);
+      return outPath;
+    }
+  });
+});
+
+app.post("/pdf-to-images", upload.single("file"), async (req, res) => {
+  await handleFileConversion(req, res, {
+    allowedExts: [".pdf"],
+    invalidExtMessage: "Only .pdf allowed",
+    workPrefix: "p2i-",
+    contentType: "application/zip",
+    outputName: "images.zip",
+    convert: async (inputPath, workDir) => {
+      const outPath = path.join(workDir, "images.zip");
+      await pdfToImagesZip(inputPath, outPath, workDir);
+      return outPath;
+    }
+  });
+});
+
+app.post("/image-to-pdf", upload.single("file"), async (req, res) => {
+  await handleFileConversion(req, res, {
+    allowedExts: [".jpg", ".jpeg", ".png", ".tiff", ".bmp"],
+    invalidExtMessage: "Only .jpg, .jpeg, .png, .tiff, or .bmp allowed",
+    workPrefix: "i2p-",
+    contentType: "application/pdf",
+    outputName: "output.pdf",
+    convert: async (inputPath, workDir) => {
+      const outPath = path.join(workDir, "output.pdf");
+      await imageToPdf(inputPath, outPath);
+      return outPath;
+    }
+  });
+});
+
 /* =========================
    TELEGRAM BOT (RICH UX)
 ========================= */
@@ -243,14 +586,14 @@ function startTelegramBot() {
   const startText =
 `✨ File Converter Bot
 
-Send me a file and I will convert it:
+Send me a file and I will convert it. Add a caption like "to pdf" or "to xlsx" to pick a target.
 
-✅ Excel (.xlsx / .xls) → PDF
-✅ PDF → Excel (.xlsx)
+Examples:
+• Upload invoice.pdf with caption "to docx"
+• Upload data.csv with caption "to xlsx"
 
 Limits:
 • Max size: ${MAX_MB} MB
-• Best PDF→Excel result: when PDF has real text tables (not scanned)
 
 Commands:
 /start - welcome
@@ -260,24 +603,143 @@ Commands:
   const helpText =
 `🧠 How to use
 
-1) Just send a file:
-   • Excel → I return PDF
-   • PDF → I return Excel
+1) Send a file with optional caption:
+   • "to pdf", "to docx", "to xlsx", "to txt", "to json", "to csv"
 
-2) Tips for best result (PDF → Excel):
-   • Works best when PDF text is selectable
-   • Scanned PDFs may give poor tables
+2) Supported conversions (examples):
+   • Excel → PDF / CSV / JSON
+   • PDF → Excel / TXT / DOCX / Images (zip)
+   • DOCX / PPTX / TXT → PDF
+   • CSV ↔ JSON, CSV → XLSX
+   • JSON → CSV / XLSX
+   • Image → PDF
 
 3) File limit:
    • Max ${MAX_MB} MB
 
 If something fails:
 • Try a smaller file
-• Try pages with clearer tables`;
+• Check that the target format is supported`;
 
   bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, startText));
   bot.onText(/\/help/, (msg) => bot.sendMessage(msg.chat.id, helpText));
   bot.onText(/\/status/, (msg) => bot.sendMessage(msg.chat.id, "✅ Bot is running and ready. Send a file."));
+
+  function parseTarget(caption) {
+    if (!caption) return null;
+    const match = caption.match(/(?:^|\s)(?:to|convert\s+to|\/to)[:\s]+([a-z0-9]+)/i);
+    return match ? match[1].toLowerCase() : null;
+  }
+
+  const telegramConversions = {
+    ".xlsx": {
+      pdf: { label: "Excel → PDF", outputExt: ".pdf", convert: (input, dir) => libreOfficeConvert(input, dir, "pdf") },
+      csv: { label: "Excel → CSV", outputExt: ".csv", convert: async (input, dir) => {
+        const outPath = path.join(dir, "output.csv");
+        await xlsxToCsv(input, outPath);
+        return outPath;
+      }},
+      json: { label: "Excel → JSON", outputExt: ".json", convert: async (input, dir) => {
+        const outPath = path.join(dir, "output.json");
+        await xlsxToJson(input, outPath);
+        return outPath;
+      }}
+    },
+    ".xls": {
+      pdf: { label: "Excel → PDF", outputExt: ".pdf", convert: (input, dir) => libreOfficeConvert(input, dir, "pdf") },
+      csv: { label: "Excel → CSV", outputExt: ".csv", convert: async (input, dir) => {
+        const outPath = path.join(dir, "output.csv");
+        await xlsxToCsv(input, outPath);
+        return outPath;
+      }},
+      json: { label: "Excel → JSON", outputExt: ".json", convert: async (input, dir) => {
+        const outPath = path.join(dir, "output.json");
+        await xlsxToJson(input, outPath);
+        return outPath;
+      }}
+    },
+    ".pdf": {
+      xlsx: { label: "PDF → Excel", outputExt: ".xlsx", convert: async (input, dir) => {
+        const outCsv = path.join(dir, "tables.csv");
+        const outXlsx = path.join(dir, "output.xlsx");
+        await tabulaPdfToCsv(input, outCsv, "all");
+        await csvToXlsx(outCsv, outXlsx);
+        return outXlsx;
+      }},
+      txt: { label: "PDF → TXT", outputExt: ".txt", convert: async (input, dir) => {
+        const outPath = path.join(dir, "output.txt");
+        await pdfToText(input, outPath);
+        return outPath;
+      }},
+      docx: { label: "PDF → DOCX", outputExt: ".docx", convert: (input, dir) => libreOfficeConvert(input, dir, "docx") },
+      images: { label: "PDF → Images (ZIP)", outputExt: ".zip", convert: async (input, dir) => {
+        const outPath = path.join(dir, "images.zip");
+        await pdfToImagesZip(input, outPath, dir);
+        return outPath;
+      }}
+    },
+    ".docx": {
+      pdf: { label: "DOCX → PDF", outputExt: ".pdf", convert: (input, dir) => libreOfficeConvert(input, dir, "pdf") }
+    },
+    ".pptx": {
+      pdf: { label: "PPTX → PDF", outputExt: ".pdf", convert: (input, dir) => libreOfficeConvert(input, dir, "pdf") }
+    },
+    ".txt": {
+      pdf: { label: "TXT → PDF", outputExt: ".pdf", convert: (input, dir) => libreOfficeConvert(input, dir, "pdf") }
+    },
+    ".csv": {
+      xlsx: { label: "CSV → XLSX", outputExt: ".xlsx", convert: async (input, dir) => {
+        const outPath = path.join(dir, "output.xlsx");
+        await csvToXlsx(input, outPath);
+        return outPath;
+      }},
+      json: { label: "CSV → JSON", outputExt: ".json", convert: async (input, dir) => {
+        const outPath = path.join(dir, "output.json");
+        await csvToJson(input, outPath);
+        return outPath;
+      }}
+    },
+    ".json": {
+      csv: { label: "JSON → CSV", outputExt: ".csv", convert: async (input, dir) => {
+        const outPath = path.join(dir, "output.csv");
+        await jsonToCsv(input, outPath);
+        return outPath;
+      }},
+      xlsx: { label: "JSON → XLSX", outputExt: ".xlsx", convert: async (input, dir) => {
+        const outPath = path.join(dir, "output.xlsx");
+        await jsonToXlsx(input, outPath);
+        return outPath;
+      }}
+    },
+    ".jpg": {
+      pdf: { label: "Image → PDF", outputExt: ".pdf", convert: async (input, dir) => {
+        const outPath = path.join(dir, "output.pdf");
+        await imageToPdf(input, outPath);
+        return outPath;
+      }}
+    },
+    ".jpeg": {
+      pdf: { label: "Image → PDF", outputExt: ".pdf", convert: async (input, dir) => {
+        const outPath = path.join(dir, "output.pdf");
+        await imageToPdf(input, outPath);
+        return outPath;
+      }}
+    },
+    ".png": {
+      pdf: { label: "Image → PDF", outputExt: ".pdf", convert: async (input, dir) => {
+        const outPath = path.join(dir, "output.pdf");
+        await imageToPdf(input, outPath);
+        return outPath;
+      }}
+    },
+    ".tiff": {
+      pdf: { label: "Image → PDF", outputExt: ".pdf", convert: async (input, dir) => {
+        const outPath = path.join(dir, "output.pdf");
+        await imageToPdf(input, outPath);
+        return outPath;
+      }}
+    }
+  };
 
   bot.on("document", async (msg) => {
     const chatId = msg.chat.id;
@@ -285,6 +747,7 @@ If something fails:
 
     const fileName = doc.file_name || "file";
     const ext = path.extname(fileName).toLowerCase();
+    const target = parseTarget(msg.caption);
 
     // Telegram gives file size too
     const size = doc.file_size || 0;
@@ -292,61 +755,43 @@ If something fails:
       return bot.sendMessage(chatId, `❌ File too large. Max allowed is ${MAX_MB} MB.`);
     }
 
-    let convertType = null;
-    let outputExt = null;
+    const options = telegramConversions[ext] || {};
+    const defaultTarget = Object.keys(options)[0];
+    const resolvedTarget = target || defaultTarget;
+    const conversion = resolvedTarget ? options[resolvedTarget] : null;
 
-    if ([".xlsx", ".xls"].includes(ext)) {
-      convertType = "excel2pdf";
-      outputExt = ".pdf";
-    } else if (ext === ".pdf") {
-      convertType = "pdf2excel";
-      outputExt = ".xlsx";
-    } else {
-      return bot.sendMessage(chatId, "❌ Unsupported file. Send only Excel (.xlsx/.xls) or PDF (.pdf).");
+    if (!conversion) {
+      const supportedTargets = Object.keys(options);
+      if (supportedTargets.length === 0) {
+        return bot.sendMessage(chatId, "❌ Unsupported file type. Send a supported file (PDF, DOCX, PPTX, XLSX, CSV, JSON, TXT, JPG/PNG).");
+      }
+      return bot.sendMessage(
+        chatId,
+        `❌ Unsupported target. Try: ${supportedTargets.map(t => `"to ${t}"`).join(", ")}.`
+      );
     }
 
-    const niceName =
-      convertType === "excel2pdf"
-        ? "Excel → PDF"
-        : "PDF → Excel";
-
-    const status = await bot.sendMessage(chatId, `⏳ Received: *${niceName}*\nDownloading...`, {
+    const status = await bot.sendMessage(chatId, `⏳ Received: *${conversion.label}*\nDownloading...`, {
       parse_mode: "Markdown"
     });
 
     const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "tg-"));
-    const outputPath = path.join(os.tmpdir(), randName(outputExt));
+    const outputPath = path.join(os.tmpdir(), randName(conversion.outputExt));
 
     try {
       // Download file from Telegram
       const downloadedPath = await bot.downloadFile(doc.file_id, workDir);
 
-      await bot.editMessageText(`⚙️ Converting: *${niceName}*\nPlease wait...`, {
+      await bot.editMessageText(`⚙️ Converting: *${conversion.label}*\nPlease wait...`, {
         chat_id: chatId,
         message_id: status.message_id,
         parse_mode: "Markdown"
       });
 
-      if (convertType === "excel2pdf") {
-        const outDir = await fs.mkdtemp(path.join(os.tmpdir(), "x2p-"));
-        try {
-          await convertExcelToPdf(downloadedPath, outDir);
-          const base = path.parse(downloadedPath).name;
-          const pdfPath = path.join(outDir, `${base}.pdf`);
-          await fs.access(pdfPath);
-          await fs.copyFile(pdfPath, outputPath);
-          await safeRmDir(outDir);
-        } catch (e) {
-          await safeRmDir(outDir);
-          throw e;
-        }
-      } else {
-        const outCsv = path.join(workDir, "tables.csv");
-        await tabulaPdfToCsv(downloadedPath, outCsv, "all");
-        await csvToXlsx(outCsv, outputPath);
-      }
+      const convertedPath = await conversion.convert(downloadedPath, workDir);
+      await fs.copyFile(convertedPath, outputPath);
 
-      await bot.editMessageText(`✅ Done: *${niceName}*\nUploading result...`, {
+      await bot.editMessageText(`✅ Done: *${conversion.label}*\nUploading result...`, {
         chat_id: chatId,
         message_id: status.message_id,
         parse_mode: "Markdown"
@@ -354,14 +799,10 @@ If something fails:
 
       // Send result file back
       await bot.sendDocument(chatId, outputPath, {
-        caption:
-          convertType === "excel2pdf"
-            ? "✅ Converted to PDF"
-            : "✅ Converted to Excel"
+        caption: `✅ ${conversion.label}`
       });
 
-      // Friendly extra note for PDF->Excel
-      if (convertType === "pdf2excel") {
+      if (resolvedTarget === "xlsx" && ext === ".pdf") {
         await bot.sendMessage(chatId, "Tip: If this PDF was scanned, results can be messy. Send a text-based PDF for best tables.");
       }
 
