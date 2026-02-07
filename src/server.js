@@ -12,6 +12,10 @@ import TelegramBot from "node-telegram-bot-api";
 import pdfParse from "pdf-parse";
 import PDFDocument from "pdfkit";
 import https from "https";
+import archiver from "archiver";
+import { Document, Packer, Paragraph } from "docx";
+import { createCanvas } from "@napi-rs/canvas";
+import pdfjsLib from "pdfjs-dist/legacy/build/pdf.js";
 
 /* =========================
    CONFIG
@@ -132,6 +136,61 @@ async function writeTextPdf(lines, outputPath) {
   });
 }
 
+async function createZip(filePaths, zipPath) {
+  await new Promise((resolve, reject) => {
+    const output = createWriteStream(zipPath);
+    const archive = archiver("zip", { zlib: { level: 9 } });
+
+    output.on("close", resolve);
+    output.on("error", reject);
+    archive.on("error", reject);
+
+    archive.pipe(output);
+    filePaths.forEach((filePath) => {
+      archive.file(filePath, { name: path.basename(filePath) });
+    });
+    archive.finalize();
+  });
+}
+
+async function pdfToDocx(pdfPath, docxPath) {
+  const raw = await fs.readFile(pdfPath);
+  const parsed = await pdfParse(raw);
+  const lines = parsed.text.split(/\r?\n/);
+  const doc = new Document({
+    sections: [
+      {
+        properties: {},
+        children: lines.map((line) => new Paragraph(line))
+      }
+    ]
+  });
+  const buffer = await Packer.toBuffer(doc);
+  await fs.writeFile(docxPath, buffer);
+}
+
+async function renderPdfToPngs(pdfPath, outDir) {
+  const data = new Uint8Array(await fs.readFile(pdfPath));
+  const loadingTask = pdfjsLib.getDocument({ data });
+  const pdfDoc = await loadingTask.promise;
+  const outputFiles = [];
+
+  for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum += 1) {
+    const page = await pdfDoc.getPage(pageNum);
+    const viewport = page.getViewport({ scale: 2 });
+    const canvas = createCanvas(viewport.width, viewport.height);
+    const context = canvas.getContext("2d");
+
+    await page.render({ canvasContext: context, viewport }).promise;
+    const buffer = canvas.toBuffer("image/png");
+    const outPath = path.join(outDir, `page-${pageNum}.png`);
+    await fs.writeFile(outPath, buffer);
+    outputFiles.push(outPath);
+  }
+
+  return outputFiles;
+}
+
 /* =========================
    CONVERTERS
 ========================= */
@@ -218,15 +277,28 @@ async function libreOfficeConvert(inputPath, outDir, target, filter = "") {
   const outPath = path.join(outDir, `${base}.${target}`);
 
   if (await commandAvailable("soffice")) {
-    await runCommand("soffice", args);
-    await fs.access(outPath);
-    return outPath;
+    try {
+      await runCommand("soffice", args);
+      await fs.access(outPath);
+      return outPath;
+    } catch (error) {
+      if (target === "docx" && path.extname(inputPath).toLowerCase() === ".pdf") {
+        await pdfToDocx(inputPath, outPath);
+        return outPath;
+      }
+      throw error;
+    }
   }
 
   if (target === "pdf" && path.extname(inputPath).toLowerCase() === ".txt") {
     const text = await fs.readFile(inputPath, "utf8");
     const lines = text.split(/\r?\n/);
     await writeTextPdf(lines, outPath);
+    return outPath;
+  }
+
+  if (target === "docx" && path.extname(inputPath).toLowerCase() === ".pdf") {
+    await pdfToDocx(inputPath, outPath);
     return outPath;
   }
 
@@ -361,15 +433,29 @@ async function pdfToText(pdfPath, txtPath) {
 }
 
 async function pdfToImagesZip(pdfPath, zipPath, workDir) {
-  if (!(await commandAvailable("pdftoppm"))) {
-    throw new Error("pdftoppm is not installed or not in PATH");
+  let pngPaths = [];
+
+  if (await commandAvailable("pdftoppm")) {
+    const prefix = path.join(workDir, "page");
+    await runCommand("pdftoppm", ["-png", pdfPath, prefix]);
+    const files = await fs.readdir(workDir);
+    pngPaths = files
+      .filter((file) => file.startsWith("page-") && file.endsWith(".png"))
+      .map((file) => path.join(workDir, file));
+  } else {
+    pngPaths = await renderPdfToPngs(pdfPath, workDir);
   }
-  if (!(await commandAvailable("zip"))) {
-    throw new Error("zip is not installed or not in PATH");
+
+  if (pngPaths.length === 0) {
+    throw new Error("No images were generated from the PDF.");
   }
-  const prefix = path.join(workDir, "page");
-  await runCommand("pdftoppm", ["-png", pdfPath, prefix]);
-  await runCommand("zip", ["-j", zipPath, `${prefix}-*.png`], { shell: true });
+
+  if (await commandAvailable("zip")) {
+    await runCommand("zip", ["-j", zipPath, ...pngPaths]);
+    return;
+  }
+
+  await createZip(pngPaths, zipPath);
 }
 
 async function imageToPdf(imagePath, pdfPath) {
