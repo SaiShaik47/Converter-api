@@ -50,7 +50,7 @@ async function safeRmDir(dir) {
   try {
     const files = await fs.readdir(dir);
     await Promise.all(files.map(f => safeUnlink(path.join(dir, f))));
-    await fs.rmdir(dir);
+    await fs.rm(dir, { recursive: true, force: true });
   } catch {}
 }
 
@@ -361,18 +361,41 @@ async function pdfToText(pdfPath, txtPath) {
 }
 
 async function pdfToImagesZip(pdfPath, zipPath, workDir) {
+  if (!(await commandAvailable("pdftoppm"))) {
+    throw new Error("pdftoppm is not installed or not in PATH");
+  }
+  if (!(await commandAvailable("zip"))) {
+    throw new Error("zip is not installed or not in PATH");
+  }
   const prefix = path.join(workDir, "page");
   await runCommand("pdftoppm", ["-png", pdfPath, prefix]);
   await runCommand("zip", ["-j", zipPath, `${prefix}-*.png`], { shell: true });
 }
 
 async function imageToPdf(imagePath, pdfPath) {
-  try {
+  if (await commandAvailable("magick")) {
     await runCommand("magick", [imagePath, pdfPath]);
-  } catch (err) {
-    if (!err.message.includes("magick")) throw err;
-    await runCommand("convert", [imagePath, pdfPath]);
+    return;
   }
+  if (await commandAvailable("convert")) {
+    await runCommand("convert", [imagePath, pdfPath]);
+    return;
+  }
+
+  await new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ autoFirstPage: false });
+    const stream = createWriteStream(pdfPath);
+
+    doc.on("error", reject);
+    stream.on("error", reject);
+    stream.on("finish", resolve);
+
+    doc.pipe(stream);
+    const image = doc.openImage(imagePath);
+    doc.addPage({ size: [image.width, image.height], margin: 0 });
+    doc.image(imagePath, 0, 0, { width: image.width, height: image.height });
+    doc.end();
+  });
 }
 
 /* =========================
@@ -414,18 +437,22 @@ async function handleFileConversion(req, res, options) {
   }
 
   const workDir = await fs.mkdtemp(path.join(os.tmpdir(), options.workPrefix || "conv-"));
+  let cleaned = false;
+  const cleanup = async () => {
+    if (cleaned) return;
+    cleaned = true;
+    await safeUnlink(inputPath);
+    await safeRmDir(workDir);
+  };
   try {
     const outputPath = await options.convert(inputPath, workDir);
     res.setHeader("Content-Type", options.contentType);
     res.setHeader("Content-Disposition", `attachment; filename="${options.outputName}"`);
     createReadStream(outputPath).pipe(res);
-    res.on("finish", async () => {
-      await safeUnlink(inputPath);
-      await safeRmDir(workDir);
-    });
+    res.on("finish", cleanup);
+    res.on("close", cleanup);
   } catch (e) {
-    await safeUnlink(inputPath);
-    await safeRmDir(workDir);
+    await cleanup();
     res.status(500).json({ ok: false, error: e.message || "Conversion failed" });
   }
 }
@@ -441,6 +468,13 @@ app.post("/excel-to-pdf", upload.single("file"), async (req, res) => {
   }
 
   const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "x2p-"));
+  let cleaned = false;
+  const cleanup = async () => {
+    if (cleaned) return;
+    cleaned = true;
+    await safeUnlink(inputPath);
+    await safeRmDir(workDir);
+  };
 
   try {
     const pdfPath = await convertExcelToPdf(inputPath, workDir);
@@ -450,13 +484,10 @@ app.post("/excel-to-pdf", upload.single("file"), async (req, res) => {
     res.setHeader("Content-Disposition", `attachment; filename="output.pdf"`);
     createReadStream(pdfPath).pipe(res);
 
-    res.on("finish", async () => {
-      await safeUnlink(inputPath);
-      await safeRmDir(workDir);
-    });
+    res.on("finish", cleanup);
+    res.on("close", cleanup);
   } catch (e) {
-    await safeUnlink(inputPath);
-    await safeRmDir(workDir);
+    await cleanup();
     res.status(500).json({ ok: false, error: e.message || "Conversion failed" });
   }
 });
@@ -475,6 +506,13 @@ app.post("/pdf-to-excel", upload.single("file"), async (req, res) => {
   const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "p2x-"));
   const outCsv = path.join(workDir, "tables.csv");
   const outXlsx = path.join(workDir, "output.xlsx");
+  let cleaned = false;
+  const cleanup = async () => {
+    if (cleaned) return;
+    cleaned = true;
+    await safeUnlink(inputPath);
+    await safeRmDir(workDir);
+  };
 
   try {
     await tabulaPdfToCsv(inputPath, outCsv, pages);
@@ -487,13 +525,10 @@ app.post("/pdf-to-excel", upload.single("file"), async (req, res) => {
     res.setHeader("Content-Disposition", `attachment; filename="output.xlsx"`);
     createReadStream(outXlsx).pipe(res);
 
-    res.on("finish", async () => {
-      await safeUnlink(inputPath);
-      await safeRmDir(workDir);
-    });
+    res.on("finish", cleanup);
+    res.on("close", cleanup);
   } catch (e) {
-    await safeUnlink(inputPath);
-    await safeRmDir(workDir);
+    await cleanup();
     res.status(500).json({ ok: false, error: e.message || "Conversion failed" });
   }
 });
