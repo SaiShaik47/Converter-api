@@ -7,10 +7,14 @@
     "start": "node src/server.js"
   },
   "dependencies": {
+    "@napi-rs/canvas": "^0.1.56",
+    "archiver": "^7.0.1",
+    "docx": "^9.1.0",
     "express": "^4.19.2",
     "multer": "^1.4.5-lts.1",
     "node-telegram-bot-api": "^0.66.0",
     "pdf-parse": "^1.1.1",
+    "pdfjs-dist": "^4.10.38",
     "pdfkit": "^0.16.0",
     "xlsx": "^0.18.5"
   }
