@@ -15,7 +15,7 @@ import https from "https";
 import archiver from "archiver";
 import { Document, Packer, Paragraph } from "docx";
 import { createCanvas } from "@napi-rs/canvas";
-import pdfjsLib from "pdfjs-dist/legacy/build/pdf.js";
+import pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 
 /* =========================
    CONFIG
