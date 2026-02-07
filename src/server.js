@@ -4,6 +4,7 @@ import os from "os";
 import path from "path";
 import fs from "fs/promises";
 import { createReadStream, createWriteStream } from "fs";
+import { pipeline } from "stream/promises";
 import { spawn } from "child_process";
 import crypto from "crypto";
 import XLSX from "xlsx";
@@ -82,7 +83,10 @@ async function downloadTelegramFile(bot, fileId, workDir) {
   const filePath = file?.file_path;
   if (!filePath) throw new Error("Unable to locate the file on Telegram servers.");
 
-  const localPath = path.join(workDir, path.basename(filePath));
+  const localPath = path.join(
+    workDir,
+    `${Date.now()}_${crypto.randomBytes(4).toString("hex")}_${path.basename(filePath)}`
+  );
   const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
 
   await new Promise((resolve, reject) => {
@@ -92,11 +96,7 @@ async function downloadTelegramFile(bot, fileId, workDir) {
         reject(new Error(`Telegram download failed with status ${res.statusCode}`));
         return;
       }
-      const stream = createWriteStream(localPath);
-      stream.on("error", reject);
-      res.on("error", reject);
-      stream.on("finish", resolve);
-      res.pipe(stream);
+      pipeline(res, createWriteStream(localPath)).then(resolve).catch(reject);
     });
     request.on("error", reject);
   });
