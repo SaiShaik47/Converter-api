@@ -10,6 +10,7 @@ import XLSX from "xlsx";
 import TelegramBot from "node-telegram-bot-api";
 import pdfParse from "pdf-parse";
 import PDFDocument from "pdfkit";
+import https from "https";
 
 /* =========================
    CONFIG
@@ -74,6 +75,34 @@ function runCommand(cmd, args, options = {}) {
       return resolve({ stdout, stderr });
     });
   });
+}
+
+async function downloadTelegramFile(bot, fileId, workDir) {
+  const file = await bot.getFile(fileId);
+  const filePath = file?.file_path;
+  if (!filePath) throw new Error("Unable to locate the file on Telegram servers.");
+
+  const localPath = path.join(workDir, path.basename(filePath));
+  const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+
+  await new Promise((resolve, reject) => {
+    const request = https.get(url, (res) => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        reject(new Error(`Telegram download failed with status ${res.statusCode}`));
+        return;
+      }
+      const stream = createWriteStream(localPath);
+      stream.on("error", reject);
+      res.on("error", reject);
+      stream.on("finish", resolve);
+      res.pipe(stream);
+    });
+    request.on("error", reject);
+  });
+
+  await fs.access(localPath);
+  return localPath;
 }
 
 function commandAvailable(cmd) {
@@ -860,7 +889,7 @@ Pro tip:
     const outputPath = path.join(os.tmpdir(), randName(conversion.outputExt));
 
     try {
-      const downloadedPath = await bot.downloadFile(fileId, workDir);
+      const downloadedPath = await downloadTelegramFile(bot, fileId, workDir);
 
       await bot.editMessageText(`⚙️ Converting: *${conversion.label}*\nPlease wait...`, {
         chat_id: chatId,
