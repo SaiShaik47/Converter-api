@@ -17,8 +17,6 @@ import { Document, Packer, Paragraph } from "docx";
 import { createCanvas } from "@napi-rs/canvas";
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = null;
-
 /* =========================
    CONFIG
 ========================= */
