@@ -1111,26 +1111,33 @@ function startTelegramBot() {
   const startText =
 `✨ File Converter Bot
 
-Send me a file and I will auto-detect what you can do with it.
-You'll always get buttons for every supported action, and you can still use captions.
+Send me a file and I’ll auto-detect every action you can do with it.
+You’ll always get smart buttons, and captions still work for quick commands.
 
 Examples:
-• Upload invoice.pdf (tap Split/Compress/Protect/Unlock)
-• Upload data.csv (tap Excel or JSON)
+• Upload invoice.pdf (tap Split / Compress / Protect / Unlock)
 • Upload report.pdf with caption "to docx"
+• Upload 2+ PDFs as a media group with caption "merge"
 
 Limits:
 • Max size: ${MAX_MB} MB
 
 Commands:
-/start - welcome
-/help  - how to use
-/status - check bot`;
+/start    - welcome
+/help     - how to use
+/status   - check bot
+/merge    - merge multiple PDFs
+/split    - split a PDF
+/compress - compress a PDF
+/protect  - password-protect a PDF
+/unlock   - unlock a PDF`;
 
   function parseTarget(caption) {
     if (!caption) return null;
     const match = caption.match(/(?:^|\s)(?:to|convert\s+to|\/to)[:\s]+([a-z0-9]+)/i);
-    return match ? match[1].toLowerCase() : null;
+    if (match) return match[1].toLowerCase();
+    const mergeMatch = caption.match(/(?:^|\s)merge\b/i);
+    return mergeMatch ? "merge" : null;
   }
 
   function parsePassword(caption) {
@@ -1284,6 +1291,7 @@ Commands:
   };
 
   const pendingConversions = new Map();
+  const pendingMediaMerges = new Map();
 
   function formatSupportedConversions(conversions) {
     const lines = [];
@@ -1320,26 +1328,110 @@ Commands:
 `🧠 How to use
 
 1) Send a file (captions are optional).
-   • I'll auto-detect the type and show buttons for every valid action.
+   • I’ll auto-detect the type and show buttons for every valid action.
    • Tap a button to run the conversion.
 
 2) Optional captions (auto-detected too):
    • "to pdf", "to docx", "to xlsx", "to txt", "to json", "to csv"
    • "to compress", "to split pages=1-3,5"
    • "to protect password=1234" or "to unlock pass=1234"
+   • "merge" (send 2+ PDFs as one media group)
 
-3) Supported conversions:
+3) PDF quick actions:
+   • /merge    → merge multiple PDFs (send as a media group)
+   • /split    → split a PDF into pages (ZIP)
+   • /compress → compress a PDF
+   • /protect  → password-protect a PDF
+   • /unlock   → unlock a PDF
+
+4) Supported conversions:
 ${formatSupportedConversions(telegramConversions)}
 
-4) File limit:
+5) File limit:
    • Max ${MAX_MB} MB
 
 Pro tip:
 • You can run multiple actions on the same file by tapping more buttons.`;
 
+  bot.setMyCommands([
+    { command: "start", description: "Welcome message" },
+    { command: "help", description: "How to use the bot" },
+    { command: "status", description: "Check bot status" },
+    { command: "merge", description: "Merge multiple PDFs" },
+    { command: "split", description: "Split a PDF into pages" },
+    { command: "compress", description: "Compress a PDF" },
+    { command: "protect", description: "Password-protect a PDF" },
+    { command: "unlock", description: "Unlock a PDF" }
+  ]);
+
   bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, startText));
   bot.onText(/\/help/, (msg) => bot.sendMessage(msg.chat.id, helpText));
   bot.onText(/\/status/, (msg) => bot.sendMessage(msg.chat.id, "✅ Bot is running and ready. Send a file."));
+  bot.onText(/\/merge/, (msg) => {
+    bot.sendMessage(
+      msg.chat.id,
+      "🧩 Merge PDFs:\nSend 2+ PDFs as a single media group and add the caption \"merge\".\nI will combine them into one PDF."
+    );
+  });
+  bot.onText(/\/split/, (msg) => {
+    bot.sendMessage(msg.chat.id, "✂️ Split PDF:\nSend a PDF and tap “PDF → Split (ZIP)” or add caption \"to split pages=1-3,5\".");
+  });
+  bot.onText(/\/compress/, (msg) => {
+    bot.sendMessage(msg.chat.id, "🗜️ Compress PDF:\nSend a PDF and tap “PDF → Compressed PDF” or add caption \"to compress\".");
+  });
+  bot.onText(/\/protect/, (msg) => {
+    bot.sendMessage(msg.chat.id, "🔒 Protect PDF:\nSend a PDF with caption \"to protect password=1234\" or tap the Protect button.");
+  });
+  bot.onText(/\/unlock/, (msg) => {
+    bot.sendMessage(msg.chat.id, "🔓 Unlock PDF:\nSend a PDF with caption \"to unlock pass=1234\" or tap the Unlock button.");
+  });
+
+  function scheduleMediaMerge(mediaGroupId) {
+    const pending = pendingMediaMerges.get(mediaGroupId);
+    if (!pending) return;
+
+    if (pending.timer) clearTimeout(pending.timer);
+    pending.timer = setTimeout(async () => {
+      pendingMediaMerges.delete(mediaGroupId);
+      if (pending.fileIds.length < 2) {
+        await bot.sendMessage(pending.chatId, "❌ Please send at least 2 PDFs in the same media group to merge.");
+        return;
+      }
+
+      const status = await bot.sendMessage(pending.chatId, "⏳ Merging PDFs...\nDownloading files...");
+      const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "tg-merge-"));
+      const outputPath = path.join(os.tmpdir(), randName(".pdf"));
+
+      try {
+        const downloadedPaths = [];
+        for (const fileId of pending.fileIds) {
+          const localPath = await downloadTelegramFile(bot, fileId, workDir);
+          downloadedPaths.push(localPath);
+        }
+
+        await bot.editMessageText("⚙️ Merging PDFs...\nPlease wait...", {
+          chat_id: pending.chatId,
+          message_id: status.message_id
+        });
+
+        await mergePdfs(downloadedPaths, outputPath);
+
+        await bot.editMessageText("✅ Done: PDF merge\nUploading result...", {
+          chat_id: pending.chatId,
+          message_id: status.message_id
+        });
+
+        await bot.sendDocument(pending.chatId, outputPath, {
+          caption: "✅ PDF merge"
+        });
+      } catch (e) {
+        await bot.sendMessage(pending.chatId, `❌ Merge failed.\nReason: ${e.message}`);
+      } finally {
+        await safeUnlink(outputPath);
+        await safeRmDir(workDir);
+      }
+    }, 1500);
+  }
 
   async function performConversion({ chatId, conversion, fileId, ext, resolvedTarget, context = {} }) {
     const status = await bot.sendMessage(chatId, `⏳ Received: *${conversion.label}*\nDownloading...`, {
@@ -1396,6 +1488,19 @@ Pro tip:
     const size = doc.file_size || 0;
     if (size > MAX_BYTES) {
       return bot.sendMessage(chatId, `❌ File too large. Max allowed is ${MAX_MB} MB.`);
+    }
+
+    if (ext === ".pdf" && msg.media_group_id && target === "merge") {
+      const mediaGroupId = msg.media_group_id;
+      const pending = pendingMediaMerges.get(mediaGroupId) || {
+        chatId,
+        fileIds: [],
+        timer: null
+      };
+      pending.fileIds.push(doc.file_id);
+      pendingMediaMerges.set(mediaGroupId, pending);
+      scheduleMediaMerge(mediaGroupId);
+      return;
     }
 
     const options = telegramConversions[ext] || {};
