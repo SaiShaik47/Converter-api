@@ -22,6 +22,9 @@ import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
    CONFIG
 ========================= */
 const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
 
@@ -69,29 +72,35 @@ function runCommand(cmd, args, options = {}) {
     if (p.stderr) p.stderr.on("data", d => (stderr += d.toString()));
 
     p.on("error", (err) => {
-      if (err.code === "ENOENT") {
-        return reject(new Error(`${cmd} is not installed or not in PATH`));
-      }
+      if (err.code === "ENOENT") return reject(new Error(`${cmd} is not installed or not in PATH`));
       return reject(err);
     });
+
     p.on("close", (code) => {
-      if (code !== 0) {
-        return reject(new Error(`${cmd} failed: ${stderr || stdout}`));
-      }
+      if (code !== 0) return reject(new Error(`${cmd} failed: ${stderr || stdout}`));
       return resolve({ stdout, stderr });
     });
+  });
+}
+
+function commandAvailable(cmd) {
+  return new Promise((resolve) => {
+    const probe = spawn("which", [cmd]);
+    probe.on("error", () => resolve(false));
+    probe.on("close", (code) => resolve(code === 0));
   });
 }
 
 async function downloadTelegramFile(bot, fileId, workDir) {
   const file = await bot.getFile(fileId);
   const filePath = file?.file_path;
-  if (!filePath) throw new Error("Unable to locate the file on Telegram servers.");
+  if (!filePath) throw new Error("Unable to locate file on Telegram servers.");
 
   const localPath = path.join(
     workDir,
     `${Date.now()}_${crypto.randomBytes(4).toString("hex")}_${path.basename(filePath)}`
   );
+
   const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
 
   await new Promise((resolve, reject) => {
@@ -110,14 +119,9 @@ async function downloadTelegramFile(bot, fileId, workDir) {
   return localPath;
 }
 
-function commandAvailable(cmd) {
-  return new Promise((resolve) => {
-    const probe = spawn("which", [cmd]);
-    probe.on("error", () => resolve(false));
-    probe.on("close", (code) => resolve(code === 0));
-  });
-}
-
+/* =========================
+   HELPERS (PDF/TXT/ZIP)
+========================= */
 async function writeTextPdf(lines, outputPath) {
   await new Promise((resolve, reject) => {
     const doc = new PDFKitDocument({ margin: 36 });
@@ -157,32 +161,35 @@ async function createZip(filePaths, zipPath) {
 async function pdfToDocx(pdfPath, docxPath) {
   const raw = await fs.readFile(pdfPath);
   const parsed = await pdfParse(raw);
-  const lines = parsed.text.split(/\r?\n/);
+  const lines = (parsed.text || "").split(/\r?\n/);
   const doc = new Document({
     sections: [
-      {
-        properties: {},
-        children: lines.map((line) => new Paragraph(line))
-      }
+      { properties: {}, children: lines.map((line) => new Paragraph(line)) }
     ]
   });
   const buffer = await Packer.toBuffer(doc);
   await fs.writeFile(docxPath, buffer);
 }
 
+/**
+ * ✅ FIX: pdfjs worker error on Railway
+ * Use disableWorker: true (no workerSrc needed)
+ */
 async function renderPdfToPngs(pdfPath, outDir) {
   const data = new Uint8Array(await fs.readFile(pdfPath));
-  const loadingTask = pdfjsLib.getDocument({ data });
+  const loadingTask = pdfjsLib.getDocument({ data, disableWorker: true });
   const pdfDoc = await loadingTask.promise;
   const outputFiles = [];
 
   for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum += 1) {
     const page = await pdfDoc.getPage(pageNum);
     const viewport = page.getViewport({ scale: 2 });
+
     const canvas = createCanvas(viewport.width, viewport.height);
     const context = canvas.getContext("2d");
 
     await page.render({ canvasContext: context, viewport }).promise;
+
     const buffer = canvas.toBuffer("image/png");
     const outPath = path.join(outDir, `page-${pageNum}.png`);
     await fs.writeFile(outPath, buffer);
@@ -196,10 +203,11 @@ async function renderPdfToPngs(pdfPath, outDir) {
    CONVERTERS
 ========================= */
 
-// Excel -> PDF (LibreOffice with JS fallback)
+// Excel -> PDF (LibreOffice fallback to JS)
 async function convertExcelToPdf(inputPath, outDir) {
   const base = path.parse(inputPath).name;
   const outputPath = path.join(outDir, `${base}.pdf`);
+
   const args = [
     "--headless",
     "--nologo",
@@ -220,7 +228,7 @@ async function convertExcelToPdf(inputPath, outDir) {
       await fs.access(outputPath);
       return outputPath;
     } catch {
-      // Fall through to JS renderer
+      // fall back to JS renderer
     }
   }
 
@@ -236,7 +244,7 @@ async function xlsxToPdf(inputPath, outputPath) {
   await writeTextPdf(lines.length ? lines : ["(empty sheet)"], outputPath);
 }
 
-// PDF -> CSV (Tabula)
+// PDF -> CSV (Tabula with fallback)
 async function tabulaPdfToCsv(pdfPath, outCsvPath, pages = "all") {
   const jar = process.env.TABULA_JAR || "/opt/tabula/tabula.jar";
   const args = ["-jar", jar, "-p", pages, "-f", "CSV", "-o", outCsvPath, pdfPath];
@@ -247,19 +255,24 @@ async function tabulaPdfToCsv(pdfPath, outCsvPath, pages = "all") {
       await runCommand("java", args);
       return;
     } catch {
-      // Fall through to JS fallback
+      // fallback
     }
   }
 
   const raw = await fs.readFile(pdfPath);
   const parsed = await pdfParse(raw);
-  const lines = parsed.text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const lines = (parsed.text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
   const csvLines = ["text", ...lines.map((line) => `"${line.replace(/"/g, '""')}"`)];
   await fs.writeFile(outCsvPath, csvLines.join("\n"));
 }
 
 async function libreOfficeConvert(inputPath, outDir, target, filter = "") {
   const targetArg = filter ? `${target}:${filter}` : target;
+
   const args = [
     "--headless",
     "--nologo",
@@ -291,22 +304,23 @@ async function libreOfficeConvert(inputPath, outDir, target, filter = "") {
     }
   }
 
+  // TXT -> PDF fallback
   if (target === "pdf" && path.extname(inputPath).toLowerCase() === ".txt") {
     const text = await fs.readFile(inputPath, "utf8");
-    const lines = text.split(/\r?\n/);
-    await writeTextPdf(lines, outPath);
+    await writeTextPdf(text.split(/\r?\n/), outPath);
     return outPath;
   }
 
+  // PDF -> DOCX fallback
   if (target === "docx" && path.extname(inputPath).toLowerCase() === ".pdf") {
     await pdfToDocx(inputPath, outPath);
     return outPath;
   }
 
-  throw new Error("soffice is not installed or not in PATH");
+  throw new Error("LibreOffice (soffice) is not installed.");
 }
 
-// CSV -> XLSX (with quotes support)
+// CSV parser
 function parseCsvLine(line) {
   const out = [];
   let cur = "";
@@ -368,9 +382,7 @@ async function csvToJson(csvPath, jsonPath) {
   const rows = lines.slice(1).map(line => parseCsvLine(line));
   const data = rows.map(row => {
     const obj = {};
-    headers.forEach((h, idx) => {
-      obj[h] = row[idx] ?? "";
-    });
+    headers.forEach((h, idx) => (obj[h] = row[idx] ?? ""));
     return obj;
   });
 
@@ -424,7 +436,7 @@ async function pdfToText(pdfPath, txtPath) {
       await runCommand("pdftotext", [pdfPath, txtPath]);
       return;
     } catch {
-      // Fall through to JS fallback
+      // fallback
     }
   }
 
@@ -447,9 +459,7 @@ async function pdfToImagesZip(pdfPath, zipPath, workDir) {
     pngPaths = await renderPdfToPngs(pdfPath, workDir);
   }
 
-  if (pngPaths.length === 0) {
-    throw new Error("No images were generated from the PDF.");
-  }
+  if (pngPaths.length === 0) throw new Error("No images generated from the PDF.");
 
   if (await commandAvailable("zip")) {
     await runCommand("zip", ["-j", zipPath, ...pngPaths]);
@@ -500,15 +510,11 @@ function parsePageRangesInput(pagesValue, totalPages) {
       const end = Math.min(totalPages, Number(rangeMatch[2]));
       if (Number.isNaN(start) || Number.isNaN(end)) continue;
       const pages = [];
-      for (let i = Math.min(start, end); i <= Math.max(start, end); i += 1) {
-        pages.push(i - 1);
-      }
+      for (let i = Math.min(start, end); i <= Math.max(start, end); i += 1) pages.push(i - 1);
       if (pages.length) ranges.push(pages);
     } else {
       const pageNum = Number(part);
-      if (!Number.isNaN(pageNum) && pageNum >= 1 && pageNum <= totalPages) {
-        ranges.push([pageNum - 1]);
-      }
+      if (!Number.isNaN(pageNum) && pageNum >= 1 && pageNum <= totalPages) ranges.push([pageNum - 1]);
     }
   }
 
@@ -523,8 +529,7 @@ async function mergePdfs(inputPaths, outputPath) {
     const pages = await merged.copyPages(doc, doc.getPageIndices());
     pages.forEach(page => merged.addPage(page));
   }
-  const mergedBytes = await merged.save();
-  await fs.writeFile(outputPath, mergedBytes);
+  await fs.writeFile(outputPath, await merged.save());
 }
 
 async function splitPdf(inputPath, outDir, pagesValue) {
@@ -535,13 +540,13 @@ async function splitPdf(inputPath, outDir, pagesValue) {
 
   const outputPaths = [];
   let partIndex = 1;
+
   for (const range of ranges) {
     const doc = await PDFDocument.create();
     const pages = await doc.copyPages(source, range);
     pages.forEach(page => doc.addPage(page));
     const outPath = path.join(outDir, `part-${partIndex}.pdf`);
-    const outBytes = await doc.save();
-    await fs.writeFile(outPath, outBytes);
+    await fs.writeFile(outPath, await doc.save());
     outputPaths.push(outPath);
     partIndex += 1;
   }
@@ -576,33 +581,18 @@ async function compressPdf(inputPath, outputPath) {
 
   const bytes = await fs.readFile(inputPath);
   const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
-  const outBytes = await doc.save({ useObjectStreams: false });
-  await fs.writeFile(outputPath, outBytes);
+  await fs.writeFile(outputPath, await doc.save({ useObjectStreams: false }));
 }
 
 async function protectPdf(inputPath, outputPath, password) {
-  if (!password) throw new Error("Password is required to protect the PDF.");
-  if (!(await commandAvailable("qpdf"))) {
-    throw new Error("qpdf is required for PDF protection but is not installed.");
-  }
-
-  await runCommand("qpdf", [
-    "--encrypt",
-    password,
-    password,
-    "256",
-    "--",
-    inputPath,
-    outputPath
-  ]);
+  if (!password) throw new Error("Password is required (example: password=1234).");
+  if (!(await commandAvailable("qpdf"))) throw new Error("Server missing qpdf. Install qpdf to enable protect/unlock.");
+  await runCommand("qpdf", ["--encrypt", password, password, "256", "--", inputPath, outputPath]);
 }
 
 async function unlockPdf(inputPath, outputPath, password) {
-  if (!password) throw new Error("Password is required to unlock the PDF.");
-  if (!(await commandAvailable("qpdf"))) {
-    throw new Error("qpdf is required for PDF unlock but is not installed.");
-  }
-
+  if (!password) throw new Error("Password is required (example: pass=1234).");
+  if (!(await commandAvailable("qpdf"))) throw new Error("Server missing qpdf. Install qpdf to enable protect/unlock.");
   await runCommand("qpdf", ["--password", password, "--decrypt", "--", inputPath, outputPath]);
 }
 
@@ -651,12 +641,14 @@ async function handleFileConversion(req, res, options) {
 
   const workDir = await fs.mkdtemp(path.join(os.tmpdir(), options.workPrefix || "conv-"));
   let cleaned = false;
+
   const cleanup = async () => {
     if (cleaned) return;
     cleaned = true;
     await safeUnlink(inputPath);
     await safeRmDir(workDir);
   };
+
   try {
     const outputPath = await options.convert(inputPath, workDir);
     res.setHeader("Content-Type", options.contentType);
@@ -671,77 +663,50 @@ async function handleFileConversion(req, res, options) {
 }
 
 app.post("/excel-to-pdf", upload.single("file"), async (req, res) => {
-  const inputPath = req.file?.path;
-  if (!inputPath) return res.status(400).json({ ok: false, error: "Upload file using key: file" });
-
-  const ext = path.extname(req.file.originalname || "").toLowerCase();
-  if (![".xlsx", ".xls"].includes(ext)) {
-    await safeUnlink(inputPath);
-    return res.status(400).json({ ok: false, error: "Only .xlsx or .xls allowed" });
-  }
-
-  const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "x2p-"));
-  let cleaned = false;
-  const cleanup = async () => {
-    if (cleaned) return;
-    cleaned = true;
-    await safeUnlink(inputPath);
-    await safeRmDir(workDir);
-  };
-
-  try {
-    const pdfPath = await convertExcelToPdf(inputPath, workDir);
-    await fs.access(pdfPath);
-
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `attachment; filename="output.pdf"`);
-    createReadStream(pdfPath).pipe(res);
-
-    res.on("finish", cleanup);
-    res.on("close", cleanup);
-  } catch (e) {
-    await cleanup();
-    res.status(500).json({ ok: false, error: e.message || "Conversion failed" });
-  }
+  await handleFileConversion(req, res, {
+    allowedExts: [".xlsx", ".xls"],
+    invalidExtMessage: "Only .xlsx or .xls allowed",
+    workPrefix: "x2p-",
+    contentType: "application/pdf",
+    outputName: "output.pdf",
+    convert: async (inputPath, workDir) => convertExcelToPdf(inputPath, workDir)
+  });
 });
 
 app.post("/pdf-to-excel", upload.single("file"), async (req, res) => {
-  const inputPath = req.file?.path;
-  if (!inputPath) return res.status(400).json({ ok: false, error: "Upload file using key: file" });
-
-  const ext = path.extname(req.file.originalname || "").toLowerCase();
-  if (ext !== ".pdf") {
-    await safeUnlink(inputPath);
-    return res.status(400).json({ ok: false, error: "Only .pdf allowed" });
-  }
-
   const pages = (req.query.pages || "all").toString();
   const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "p2x-"));
-  const outCsv = path.join(workDir, "tables.csv");
-  const outXlsx = path.join(workDir, "output.xlsx");
   let cleaned = false;
-  const cleanup = async () => {
+
+  const cleanup = async (inputPath) => {
     if (cleaned) return;
     cleaned = true;
     await safeUnlink(inputPath);
     await safeRmDir(workDir);
   };
 
+  const inputPath = req.file?.path;
+  if (!inputPath) return res.status(400).json({ ok: false, error: "Upload file using key: file" });
+  if (path.extname(req.file.originalname || "").toLowerCase() !== ".pdf") {
+    await cleanup(inputPath);
+    return res.status(400).json({ ok: false, error: "Only .pdf allowed" });
+  }
+
   try {
+    const outCsv = path.join(workDir, "tables.csv");
+    const outXlsx = path.join(workDir, "output.xlsx");
+
     await tabulaPdfToCsv(inputPath, outCsv, pages);
     await csvToXlsx(outCsv, outXlsx);
 
-    res.setHeader(
-      "Content-Type",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    );
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", `attachment; filename="output.xlsx"`);
     createReadStream(outXlsx).pipe(res);
 
-    res.on("finish", cleanup);
-    res.on("close", cleanup);
+    res.on("finish", () => cleanup(inputPath));
+    res.on("close", () => cleanup(inputPath));
   } catch (e) {
-    await cleanup();
+    await cleanup(inputPath);
     res.status(500).json({ ok: false, error: e.message || "Conversion failed" });
   }
 });
@@ -940,6 +905,7 @@ app.post("/pdf-merge", upload.array("files", 20), async (req, res) => {
 
   const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "pmerge-"));
   let cleaned = false;
+
   const cleanup = async () => {
     if (cleaned) return;
     cleaned = true;
@@ -950,9 +916,11 @@ app.post("/pdf-merge", upload.array("files", 20), async (req, res) => {
   try {
     const outPath = path.join(workDir, "merged.pdf");
     await mergePdfs(inputPaths, outPath);
+
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `attachment; filename="merged.pdf"`);
     createReadStream(outPath).pipe(res);
+
     res.on("finish", cleanup);
     res.on("close", cleanup);
   } catch (e) {
@@ -962,139 +930,70 @@ app.post("/pdf-merge", upload.array("files", 20), async (req, res) => {
 });
 
 app.post("/pdf-split", upload.single("file"), async (req, res) => {
-  const inputPath = req.file?.path;
-  if (!inputPath) return res.status(400).json({ ok: false, error: "Upload file using key: file" });
-
-  const ext = path.extname(req.file.originalname || "").toLowerCase();
-  if (ext !== ".pdf") {
-    await safeUnlink(inputPath);
-    return res.status(400).json({ ok: false, error: "Only .pdf allowed" });
-  }
-
   const pagesValue = (req.query.pages || "all").toString();
-  const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "psplit-"));
-  let cleaned = false;
-  const cleanup = async () => {
-    if (cleaned) return;
-    cleaned = true;
-    await safeUnlink(inputPath);
-    await safeRmDir(workDir);
-  };
 
-  try {
-    const outputFiles = await splitPdf(inputPath, workDir, pagesValue);
-    const outZip = path.join(workDir, "split-pages.zip");
-    await createZip(outputFiles, outZip);
-    res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", `attachment; filename="split-pages.zip"`);
-    createReadStream(outZip).pipe(res);
-    res.on("finish", cleanup);
-    res.on("close", cleanup);
-  } catch (e) {
-    await cleanup();
-    res.status(500).json({ ok: false, error: e.message || "Split failed" });
-  }
+  await handleFileConversion(req, res, {
+    allowedExts: [".pdf"],
+    invalidExtMessage: "Only .pdf allowed",
+    workPrefix: "psplit-",
+    contentType: "application/zip",
+    outputName: "split-pages.zip",
+    convert: async (inputPath, workDir) => {
+      const outputFiles = await splitPdf(inputPath, workDir, pagesValue);
+      const outZip = path.join(workDir, "split-pages.zip");
+      await createZip(outputFiles, outZip);
+      return outZip;
+    }
+  });
 });
 
 app.post("/pdf-compress", upload.single("file"), async (req, res) => {
-  const inputPath = req.file?.path;
-  if (!inputPath) return res.status(400).json({ ok: false, error: "Upload file using key: file" });
-
-  const ext = path.extname(req.file.originalname || "").toLowerCase();
-  if (ext !== ".pdf") {
-    await safeUnlink(inputPath);
-    return res.status(400).json({ ok: false, error: "Only .pdf allowed" });
-  }
-
-  const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "pcomp-"));
-  let cleaned = false;
-  const cleanup = async () => {
-    if (cleaned) return;
-    cleaned = true;
-    await safeUnlink(inputPath);
-    await safeRmDir(workDir);
-  };
-
-  try {
-    const outPath = path.join(workDir, "compressed.pdf");
-    await compressPdf(inputPath, outPath);
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `attachment; filename="compressed.pdf"`);
-    createReadStream(outPath).pipe(res);
-    res.on("finish", cleanup);
-    res.on("close", cleanup);
-  } catch (e) {
-    await cleanup();
-    res.status(500).json({ ok: false, error: e.message || "Compression failed" });
-  }
+  await handleFileConversion(req, res, {
+    allowedExts: [".pdf"],
+    invalidExtMessage: "Only .pdf allowed",
+    workPrefix: "pcomp-",
+    contentType: "application/pdf",
+    outputName: "compressed.pdf",
+    convert: async (inputPath, workDir) => {
+      const outPath = path.join(workDir, "compressed.pdf");
+      await compressPdf(inputPath, outPath);
+      return outPath;
+    }
+  });
 });
 
 app.post("/pdf-protect", upload.single("file"), async (req, res) => {
-  const inputPath = req.file?.path;
-  if (!inputPath) return res.status(400).json({ ok: false, error: "Upload file using key: file" });
-
-  const ext = path.extname(req.file.originalname || "").toLowerCase();
-  if (ext !== ".pdf") {
-    await safeUnlink(inputPath);
-    return res.status(400).json({ ok: false, error: "Only .pdf allowed" });
-  }
-
   const password = (req.body?.password || "").toString();
-  const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "pprot-"));
-  let cleaned = false;
-  const cleanup = async () => {
-    if (cleaned) return;
-    cleaned = true;
-    await safeUnlink(inputPath);
-    await safeRmDir(workDir);
-  };
 
-  try {
-    const outPath = path.join(workDir, "protected.pdf");
-    await protectPdf(inputPath, outPath, password);
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `attachment; filename="protected.pdf"`);
-    createReadStream(outPath).pipe(res);
-    res.on("finish", cleanup);
-    res.on("close", cleanup);
-  } catch (e) {
-    await cleanup();
-    res.status(500).json({ ok: false, error: e.message || "Protection failed" });
-  }
+  await handleFileConversion(req, res, {
+    allowedExts: [".pdf"],
+    invalidExtMessage: "Only .pdf allowed",
+    workPrefix: "pprot-",
+    contentType: "application/pdf",
+    outputName: "protected.pdf",
+    convert: async (inputPath, workDir) => {
+      const outPath = path.join(workDir, "protected.pdf");
+      await protectPdf(inputPath, outPath, password);
+      return outPath;
+    }
+  });
 });
 
 app.post("/pdf-unlock", upload.single("file"), async (req, res) => {
-  const inputPath = req.file?.path;
-  if (!inputPath) return res.status(400).json({ ok: false, error: "Upload file using key: file" });
-
-  const ext = path.extname(req.file.originalname || "").toLowerCase();
-  if (ext !== ".pdf") {
-    await safeUnlink(inputPath);
-    return res.status(400).json({ ok: false, error: "Only .pdf allowed" });
-  }
-
   const password = (req.body?.password || "").toString();
-  const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "punlock-"));
-  let cleaned = false;
-  const cleanup = async () => {
-    if (cleaned) return;
-    cleaned = true;
-    await safeUnlink(inputPath);
-    await safeRmDir(workDir);
-  };
 
-  try {
-    const outPath = path.join(workDir, "unlocked.pdf");
-    await unlockPdf(inputPath, outPath, password);
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `attachment; filename="unlocked.pdf"`);
-    createReadStream(outPath).pipe(res);
-    res.on("finish", cleanup);
-    res.on("close", cleanup);
-  } catch (e) {
-    await cleanup();
-    res.status(500).json({ ok: false, error: e.message || "Unlock failed" });
-  }
+  await handleFileConversion(req, res, {
+    allowedExts: [".pdf"],
+    invalidExtMessage: "Only .pdf allowed",
+    workPrefix: "punlock-",
+    contentType: "application/pdf",
+    outputName: "unlocked.pdf",
+    convert: async (inputPath, workDir) => {
+      const outPath = path.join(workDir, "unlocked.pdf");
+      await unlockPdf(inputPath, outPath, password);
+      return outPath;
+    }
+  });
 });
 
 /* =========================
@@ -1106,31 +1005,55 @@ function startTelegramBot() {
     return;
   }
 
-  const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+  const bot = new TelegramBot(BOT_TOKEN, {
+    polling: {
+      interval: 500,
+      autoStart: true,
+      params: { timeout: 10 }
+    }
+  });
+
+  // ✅ Prevent "409 terminated by other getUpdates request" staying broken
+  bot.on("polling_error", async (err) => {
+    const msg = String(err?.message || "");
+    console.log("polling_error:", msg);
+
+    if (msg.includes("409") || msg.includes("terminated by other getUpdates request")) {
+      try {
+        await bot.stopPolling();
+      } catch {}
+      setTimeout(() => {
+        try { bot.startPolling(); } catch {}
+      }, 2500);
+    }
+  });
 
   const startText =
-`✨ File Converter Bot
+`👋 Welcome to File Converter Bot
 
-Send me a file and I’ll auto-detect every action you can do with it.
-You’ll always get smart buttons, and captions still work for quick commands.
+Send a file and I’ll auto-detect everything you can do with it.
+You’ll get smart buttons for every supported tool.
 
-Examples:
-• Upload invoice.pdf (tap Split / Compress / Protect / Unlock)
-• Upload report.pdf with caption "to docx"
-• Upload 2+ PDFs as a media group with caption "merge"
+✨ Quick Examples:
+• Send invoice.pdf → tap Split / Compress / Protect / Unlock
+• Send report.pdf with caption: to docx
+• Send 2+ PDFs together with caption: merge
 
-Limits:
-• Max size: ${MAX_MB} MB
+📦 Limits:
+• Max file size: ${MAX_MB} MB
 
-Commands:
+📌 Commands:
 /start    - welcome
 /help     - how to use
-/status   - check bot
-/merge    - merge multiple PDFs
-/split    - split a PDF
-/compress - compress a PDF
-/protect  - password-protect a PDF
-/unlock   - unlock a PDF`;
+/status   - bot status
+/merge    - merge PDFs (media-group OR step mode)
+/done     - finish merge (step mode)
+/cancel   - cancel merge mode
+/split    - split PDF pages
+/compress - compress PDF
+/protect  - protect PDF (password)
+/unlock   - unlock PDF (password)
+`;
 
   function parseTarget(caption) {
     if (!caption) return null;
@@ -1220,15 +1143,9 @@ Commands:
         return outPath;
       }}
     },
-    ".docx": {
-      pdf: { label: "DOCX → PDF", outputExt: ".pdf", convert: (input, dir) => libreOfficeConvert(input, dir, "pdf") }
-    },
-    ".pptx": {
-      pdf: { label: "PPTX → PDF", outputExt: ".pdf", convert: (input, dir) => libreOfficeConvert(input, dir, "pdf") }
-    },
-    ".txt": {
-      pdf: { label: "TXT → PDF", outputExt: ".pdf", convert: (input, dir) => libreOfficeConvert(input, dir, "pdf") }
-    },
+    ".docx": { pdf: { label: "DOCX → PDF", outputExt: ".pdf", convert: (input, dir) => libreOfficeConvert(input, dir, "pdf") } },
+    ".pptx": { pdf: { label: "PPTX → PDF", outputExt: ".pdf", convert: (input, dir) => libreOfficeConvert(input, dir, "pdf") } },
+    ".txt": { pdf: { label: "TXT → PDF", outputExt: ".pdf", convert: (input, dir) => libreOfficeConvert(input, dir, "pdf") } },
     ".csv": {
       xlsx: { label: "CSV → XLSX", outputExt: ".xlsx", convert: async (input, dir) => {
         const outPath = path.join(dir, "output.xlsx");
@@ -1253,45 +1170,38 @@ Commands:
         return outPath;
       }}
     },
-    ".jpg": {
-      pdf: { label: "Image → PDF", outputExt: ".pdf", convert: async (input, dir) => {
-        const outPath = path.join(dir, "output.pdf");
-        await imageToPdf(input, outPath);
-        return outPath;
-      }}
-    },
-    ".jpeg": {
-      pdf: { label: "Image → PDF", outputExt: ".pdf", convert: async (input, dir) => {
-        const outPath = path.join(dir, "output.pdf");
-        await imageToPdf(input, outPath);
-        return outPath;
-      }}
-    },
-    ".png": {
-      pdf: { label: "Image → PDF", outputExt: ".pdf", convert: async (input, dir) => {
-        const outPath = path.join(dir, "output.pdf");
-        await imageToPdf(input, outPath);
-        return outPath;
-      }}
-    },
-    ".tiff": {
-      pdf: { label: "Image → PDF", outputExt: ".pdf", convert: async (input, dir) => {
-        const outPath = path.join(dir, "output.pdf");
-        await imageToPdf(input, outPath);
-        return outPath;
-      }}
-    },
-    ".bmp": {
-      pdf: { label: "Image → PDF", outputExt: ".pdf", convert: async (input, dir) => {
-        const outPath = path.join(dir, "output.pdf");
-        await imageToPdf(input, outPath);
-        return outPath;
-      }}
-    }
+    ".jpg": { pdf: { label: "Image → PDF", outputExt: ".pdf", convert: async (input, dir) => {
+      const outPath = path.join(dir, "output.pdf");
+      await imageToPdf(input, outPath);
+      return outPath;
+    }}},
+    ".jpeg": { pdf: { label: "Image → PDF", outputExt: ".pdf", convert: async (input, dir) => {
+      const outPath = path.join(dir, "output.pdf");
+      await imageToPdf(input, outPath);
+      return outPath;
+    }}},
+    ".png": { pdf: { label: "Image → PDF", outputExt: ".pdf", convert: async (input, dir) => {
+      const outPath = path.join(dir, "output.pdf");
+      await imageToPdf(input, outPath);
+      return outPath;
+    }}},
+    ".tiff": { pdf: { label: "Image → PDF", outputExt: ".pdf", convert: async (input, dir) => {
+      const outPath = path.join(dir, "output.pdf");
+      await imageToPdf(input, outPath);
+      return outPath;
+    }}},
+    ".bmp": { pdf: { label: "Image → PDF", outputExt: ".pdf", convert: async (input, dir) => {
+      const outPath = path.join(dir, "output.pdf");
+      await imageToPdf(input, outPath);
+      return outPath;
+    }}}
   };
 
   const pendingConversions = new Map();
   const pendingMediaMerges = new Map();
+
+  // ✅ Step-by-step merge mode
+  const mergeSessions = new Map(); // chatId -> { fileIds: [], startedAt: Date.now() }
 
   function formatSupportedConversions(conversions) {
     const lines = [];
@@ -1325,39 +1235,41 @@ Commands:
   }
 
   const helpText =
-`🧠 How to use
+`🧠 HOW TO USE
 
-1) Send a file (captions are optional).
-   • I’ll auto-detect the type and show buttons for every valid action.
-   • Tap a button to run the conversion.
+1) Send a file (caption optional)
+• I detect the type & show buttons
+• Tap a button to run
 
-2) Optional captions (auto-detected too):
-   • "to pdf", "to docx", "to xlsx", "to txt", "to json", "to csv"
-   • "to compress", "to split pages=1-3,5"
-   • "to protect password=1234" or "to unlock pass=1234"
-   • "merge" (send 2+ PDFs as one media group)
+2) Captions (optional)
+Convert:
+• to pdf / to docx / to xlsx / to txt / to csv / to json
+PDF tools:
+• to compress
+• to split pages=1-3,5
+• to protect password=1234
+• to unlock pass=1234
 
-3) PDF quick actions:
-   • /merge    → merge multiple PDFs (send as a media group)
-   • /split    → split a PDF into pages (ZIP)
-   • /compress → compress a PDF
-   • /protect  → password-protect a PDF
-   • /unlock   → unlock a PDF
+3) Merge PDFs (2 ways)
+✅ A) Media group:
+• Send 2+ PDFs together
+• Caption: merge
 
-4) Supported conversions:
+✅ B) Step mode:
+/merge → send PDFs one by one → /done
+
+4) Supported types
 ${formatSupportedConversions(telegramConversions)}
 
-5) File limit:
-   • Max ${MAX_MB} MB
-
-Pro tip:
-• You can run multiple actions on the same file by tapping more buttons.`;
+Limit: ${MAX_MB} MB`;
 
   bot.setMyCommands([
-    { command: "start", description: "Welcome message" },
-    { command: "help", description: "How to use the bot" },
-    { command: "status", description: "Check bot status" },
-    { command: "merge", description: "Merge multiple PDFs" },
+    { command: "start", description: "Welcome" },
+    { command: "help", description: "How to use" },
+    { command: "status", description: "Bot status" },
+    { command: "merge", description: "Merge PDFs (media group or step mode)" },
+    { command: "done", description: "Finish merge (step mode)" },
+    { command: "cancel", description: "Cancel merge mode" },
     { command: "split", description: "Split a PDF into pages" },
     { command: "compress", description: "Compress a PDF" },
     { command: "protect", description: "Password-protect a PDF" },
@@ -1366,24 +1278,66 @@ Pro tip:
 
   bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, startText));
   bot.onText(/\/help/, (msg) => bot.sendMessage(msg.chat.id, helpText));
-  bot.onText(/\/status/, (msg) => bot.sendMessage(msg.chat.id, "✅ Bot is running and ready. Send a file."));
+  bot.onText(/\/status/, (msg) => bot.sendMessage(msg.chat.id, "✅ Bot is running. Send a file."));
+  bot.onText(/\/split/, (msg) => bot.sendMessage(msg.chat.id, "✂️ Split: Send a PDF and tap “Split (ZIP)” or caption: to split pages=1-3,5"));
+  bot.onText(/\/compress/, (msg) => bot.sendMessage(msg.chat.id, "🗜️ Compress: Send a PDF and tap “Compressed PDF” or caption: to compress"));
+  bot.onText(/\/protect/, (msg) => bot.sendMessage(msg.chat.id, "🔒 Protect: Send PDF with caption: to protect password=1234 (or tap Protect)"));
+  bot.onText(/\/unlock/, (msg) => bot.sendMessage(msg.chat.id, "🔓 Unlock: Send PDF with caption: to unlock pass=1234 (or tap Unlock)"));
+
   bot.onText(/\/merge/, (msg) => {
+    mergeSessions.set(msg.chat.id, { fileIds: [], startedAt: Date.now() });
     bot.sendMessage(
       msg.chat.id,
-      "🧩 Merge PDFs:\nSend 2+ PDFs as a single media group and add the caption \"merge\".\nI will combine them into one PDF."
+      "🧩 Merge mode ON.\nSend PDFs one by one now.\nWhen finished, type /done\nTo cancel: /cancel"
     );
   });
-  bot.onText(/\/split/, (msg) => {
-    bot.sendMessage(msg.chat.id, "✂️ Split PDF:\nSend a PDF and tap “PDF → Split (ZIP)” or add caption \"to split pages=1-3,5\".");
+
+  bot.onText(/\/cancel/, (msg) => {
+    mergeSessions.delete(msg.chat.id);
+    bot.sendMessage(msg.chat.id, "❌ Merge mode cancelled.");
   });
-  bot.onText(/\/compress/, (msg) => {
-    bot.sendMessage(msg.chat.id, "🗜️ Compress PDF:\nSend a PDF and tap “PDF → Compressed PDF” or add caption \"to compress\".");
-  });
-  bot.onText(/\/protect/, (msg) => {
-    bot.sendMessage(msg.chat.id, "🔒 Protect PDF:\nSend a PDF with caption \"to protect password=1234\" or tap the Protect button.");
-  });
-  bot.onText(/\/unlock/, (msg) => {
-    bot.sendMessage(msg.chat.id, "🔓 Unlock PDF:\nSend a PDF with caption \"to unlock pass=1234\" or tap the Unlock button.");
+
+  bot.onText(/\/done/, async (msg) => {
+    const chatId = msg.chat.id;
+    const session = mergeSessions.get(chatId);
+    if (!session) return bot.sendMessage(chatId, "No active merge. Use /merge first.");
+
+    mergeSessions.delete(chatId);
+
+    if (session.fileIds.length < 2) {
+      return bot.sendMessage(chatId, "❌ Need at least 2 PDFs to merge. Use /merge again.");
+    }
+
+    const status = await bot.sendMessage(chatId, "⏳ Merging PDFs...\nDownloading files...");
+    const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "tg-merge-step-"));
+    const outputPath = path.join(os.tmpdir(), randName(".pdf"));
+
+    try {
+      const downloadedPaths = [];
+      for (const fileId of session.fileIds) {
+        const localPath = await downloadTelegramFile(bot, fileId, workDir);
+        downloadedPaths.push(localPath);
+      }
+
+      await bot.editMessageText("⚙️ Merging PDFs...\nPlease wait...", {
+        chat_id: chatId,
+        message_id: status.message_id
+      });
+
+      await mergePdfs(downloadedPaths, outputPath);
+
+      await bot.editMessageText("✅ Done: PDF merge\nUploading result...", {
+        chat_id: chatId,
+        message_id: status.message_id
+      });
+
+      await bot.sendDocument(chatId, outputPath, { caption: "✅ PDF merge" });
+    } catch (e) {
+      await bot.sendMessage(chatId, `❌ Merge failed.\nReason: ${e.message}`);
+    } finally {
+      await safeUnlink(outputPath);
+      await safeRmDir(workDir);
+    }
   });
 
   function scheduleMediaMerge(mediaGroupId) {
@@ -1391,8 +1345,10 @@ Pro tip:
     if (!pending) return;
 
     if (pending.timer) clearTimeout(pending.timer);
+
     pending.timer = setTimeout(async () => {
       pendingMediaMerges.delete(mediaGroupId);
+
       if (pending.fileIds.length < 2) {
         await bot.sendMessage(pending.chatId, "❌ Please send at least 2 PDFs in the same media group to merge.");
         return;
@@ -1421,9 +1377,7 @@ Pro tip:
           message_id: status.message_id
         });
 
-        await bot.sendDocument(pending.chatId, outputPath, {
-          caption: "✅ PDF merge"
-        });
+        await bot.sendDocument(pending.chatId, outputPath, { caption: "✅ PDF merge" });
       } catch (e) {
         await bot.sendMessage(pending.chatId, `❌ Merge failed.\nReason: ${e.message}`);
       } finally {
@@ -1434,7 +1388,7 @@ Pro tip:
   }
 
   async function performConversion({ chatId, conversion, fileId, ext, resolvedTarget, context = {} }) {
-    const status = await bot.sendMessage(chatId, `⏳ Received: *${conversion.label}*\nDownloading...`, {
+    const status = await bot.sendMessage(chatId, `⏳ *${conversion.label}*\nDownloading...`, {
       parse_mode: "Markdown"
     });
 
@@ -1444,7 +1398,7 @@ Pro tip:
     try {
       const downloadedPath = await downloadTelegramFile(bot, fileId, workDir);
 
-      await bot.editMessageText(`⚙️ Converting: *${conversion.label}*\nPlease wait...`, {
+      await bot.editMessageText(`⚙️ *${conversion.label}*\nPlease wait...`, {
         chat_id: chatId,
         message_id: status.message_id,
         parse_mode: "Markdown"
@@ -1453,21 +1407,19 @@ Pro tip:
       const convertedPath = await conversion.convert(downloadedPath, workDir, context);
       await fs.copyFile(convertedPath, outputPath);
 
-      await bot.editMessageText(`✅ Done: *${conversion.label}*\nUploading result...`, {
+      await bot.editMessageText(`✅ *${conversion.label}*\nUploading...`, {
         chat_id: chatId,
         message_id: status.message_id,
         parse_mode: "Markdown"
       });
 
-      await bot.sendDocument(chatId, outputPath, {
-        caption: `✅ ${conversion.label}`
-      });
+      await bot.sendDocument(chatId, outputPath, { caption: `✅ ${conversion.label}` });
 
       if (resolvedTarget === "xlsx" && ext === ".pdf") {
-        await bot.sendMessage(chatId, "Tip: If this PDF was scanned, results can be messy. Send a text-based PDF for best tables.");
+        await bot.sendMessage(chatId, "Tip: Scanned PDFs may not extract tables well. Text-based PDFs work best.");
       }
     } catch (e) {
-      await bot.sendMessage(chatId, `❌ Conversion failed.\nReason: ${e.message}`);
+      await bot.sendMessage(chatId, `❌ Failed.\nReason: ${e.message}`);
     } finally {
       await safeUnlink(outputPath);
       await safeRmDir(workDir);
@@ -1477,19 +1429,27 @@ Pro tip:
   bot.on("document", async (msg) => {
     const chatId = msg.chat.id;
     const doc = msg.document;
+    if (!doc) return;
 
     const fileName = doc.file_name || "file";
     const ext = path.extname(fileName).toLowerCase();
+
+    const size = doc.file_size || 0;
+    if (size > MAX_BYTES) return bot.sendMessage(chatId, `❌ File too large. Max ${MAX_MB} MB.`);
+
+    // Step merge mode: collect PDFs
+    const mergeSession = mergeSessions.get(chatId);
+    if (mergeSession && ext === ".pdf") {
+      mergeSession.fileIds.push(doc.file_id);
+      mergeSessions.set(chatId, mergeSession);
+      return bot.sendMessage(chatId, `✅ Added: ${fileName}\nTotal PDFs: ${mergeSession.fileIds.length}\nSend more or type /done`);
+    }
+
     const target = parseTarget(msg.caption);
     const password = parsePassword(msg.caption);
     const pages = parsePages(msg.caption);
 
-    // Telegram gives file size too
-    const size = doc.file_size || 0;
-    if (size > MAX_BYTES) {
-      return bot.sendMessage(chatId, `❌ File too large. Max allowed is ${MAX_MB} MB.`);
-    }
-
+    // Media-group merge mode
     if (ext === ".pdf" && msg.media_group_id && target === "merge") {
       const mediaGroupId = msg.media_group_id;
       const pending = pendingMediaMerges.get(mediaGroupId) || {
@@ -1506,32 +1466,31 @@ Pro tip:
     const options = telegramConversions[ext] || {};
     const supportedTargets = Object.keys(options);
     if (supportedTargets.length === 0) {
-      return bot.sendMessage(chatId, "❌ Unsupported file type. Send a supported file (PDF, DOCX, PPTX, XLSX, CSV, JSON, TXT, JPG/PNG/BMP).");
+      return bot.sendMessage(
+        chatId,
+        "❌ Unsupported file type.\nSend: PDF, DOCX, PPTX, XLSX, CSV, JSON, TXT, JPG/PNG/BMP."
+      );
     }
 
     const token = crypto.randomBytes(6).toString("hex");
     pendingConversions.set(token, { fileId: doc.file_id, ext, fileName, chatId });
     setTimeout(() => pendingConversions.delete(token), 10 * 60 * 1000);
 
-    await bot.sendMessage(chatId, `✅ Detected *${fileName}*.\nChoose an action:`, {
+    await bot.sendMessage(chatId, `✅ Detected *${fileName}*\nChoose an action:`, {
       parse_mode: "Markdown",
       reply_markup: buildTargetKeyboard(options, token)
     });
 
-    if (!target) {
-      return;
-    }
+    // Auto-run if caption target exists
+    if (!target) return;
 
     const conversion = options[target];
     if (!conversion) {
-      return bot.sendMessage(
-        chatId,
-        `❌ Unsupported target "${target}". Pick from the buttons above.`
-      );
+      return bot.sendMessage(chatId, `❌ Target "${target}" not supported. Use buttons.`);
     }
 
     if (conversion.needsPassword && !password) {
-      return bot.sendMessage(chatId, "🔐 This action requires a password. Add a caption like: 'protect password=1234' or 'unlock pass=1234'.");
+      return bot.sendMessage(chatId, "🔐 Password required.\nExample: to protect password=1234\nExample: to unlock pass=1234");
     }
 
     await performConversion({
@@ -1550,26 +1509,30 @@ Pro tip:
 
     const [, token, target] = data.split(":");
     const pending = pendingConversions.get(token);
+
     if (!pending) {
-      await bot.answerCallbackQuery(query.id, { text: "This request expired. Please send the file again." });
+      await bot.answerCallbackQuery(query.id, { text: "Expired. Please send the file again." });
       return;
     }
 
     const options = telegramConversions[pending.ext] || {};
     const conversion = options[target];
+
     if (!conversion) {
-      await bot.answerCallbackQuery(query.id, { text: "That conversion is no longer available." });
+      await bot.answerCallbackQuery(query.id, { text: "Not available anymore." });
       return;
     }
 
     pendingConversions.delete(token);
     await bot.answerCallbackQuery(query.id, { text: `Starting ${conversion.label}...` });
-    const caption = query.message?.caption || "";
+
+    // For password/pages, read from the original document caption if available
+    const caption = query.message?.caption || query.message?.text || "";
     const password = parsePassword(caption);
     const pages = parsePages(caption);
 
     if (conversion.needsPassword && !password) {
-      await bot.sendMessage(pending.chatId, "🔐 This action requires a password. Re-send the PDF with caption: 'protect password=1234' or 'unlock pass=1234'.");
+      await bot.sendMessage(pending.chatId, "🔐 Password required.\nRe-send PDF with: to protect password=1234 OR to unlock pass=1234");
       return;
     }
 
