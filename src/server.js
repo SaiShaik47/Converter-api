@@ -1111,11 +1111,13 @@ function startTelegramBot() {
   const startText =
 `✨ File Converter Bot
 
-Send me a file and I will convert it. Add a caption like "to pdf" or "to xlsx" to pick a target.
+Send me a file and I will auto-detect what you can do with it.
+You'll always get buttons for every supported action, and you can still use captions.
 
 Examples:
-• Upload invoice.pdf with caption "to docx"
-• Upload data.csv with caption "to xlsx"
+• Upload invoice.pdf (tap Split/Compress/Protect/Unlock)
+• Upload data.csv (tap Excel or JSON)
+• Upload report.pdf with caption "to docx"
 
 Limits:
 • Max size: ${MAX_MB} MB
@@ -1317,19 +1319,23 @@ Commands:
   const helpText =
 `🧠 How to use
 
-1) Send a file with an optional caption:
+1) Send a file (captions are optional).
+   • I'll auto-detect the type and show buttons for every valid action.
+   • Tap a button to run the conversion.
+
+2) Optional captions (auto-detected too):
    • "to pdf", "to docx", "to xlsx", "to txt", "to json", "to csv"
    • "to compress", "to split pages=1-3,5"
    • "to protect password=1234" or "to unlock pass=1234"
 
-2) Supported conversions:
+3) Supported conversions:
 ${formatSupportedConversions(telegramConversions)}
 
-3) File limit:
+4) File limit:
    • Max ${MAX_MB} MB
 
 Pro tip:
-• If you skip the caption, I'll show smart buttons for possible targets.`;
+• You can run multiple actions on the same file by tapping more buttons.`;
 
   bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, startText));
   bot.onText(/\/help/, (msg) => bot.sendMessage(msg.chat.id, helpText));
@@ -1398,25 +1404,24 @@ Pro tip:
       return bot.sendMessage(chatId, "❌ Unsupported file type. Send a supported file (PDF, DOCX, PPTX, XLSX, CSV, JSON, TXT, JPG/PNG/BMP).");
     }
 
+    const token = crypto.randomBytes(6).toString("hex");
+    pendingConversions.set(token, { fileId: doc.file_id, ext, fileName, chatId });
+    setTimeout(() => pendingConversions.delete(token), 10 * 60 * 1000);
+
+    await bot.sendMessage(chatId, `✅ Detected *${fileName}*.\nChoose an action:`, {
+      parse_mode: "Markdown",
+      reply_markup: buildTargetKeyboard(options, token)
+    });
+
     if (!target) {
-      const token = crypto.randomBytes(6).toString("hex");
-      pendingConversions.set(token, { fileId: doc.file_id, ext, fileName, chatId });
-      setTimeout(() => pendingConversions.delete(token), 10 * 60 * 1000);
-      return bot.sendMessage(chatId, `✅ Detected *${fileName}*.\nChoose a conversion:`, {
-        parse_mode: "Markdown",
-        reply_markup: buildTargetKeyboard(options, token)
-      });
+      return;
     }
 
     const conversion = options[target];
     if (!conversion) {
-      const token = crypto.randomBytes(6).toString("hex");
-      pendingConversions.set(token, { fileId: doc.file_id, ext, fileName, chatId });
-      setTimeout(() => pendingConversions.delete(token), 10 * 60 * 1000);
       return bot.sendMessage(
         chatId,
-        `❌ Unsupported target "${target}". Pick from the buttons below:`,
-        { reply_markup: buildTargetKeyboard(options, token) }
+        `❌ Unsupported target "${target}". Pick from the buttons above.`
       );
     }
 
