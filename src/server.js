@@ -91,14 +91,18 @@ function commandAvailable(cmd) {
   });
 }
 
-async function downloadTelegramFile(bot, fileId, workDir) {
+async function downloadTelegramFile(bot, fileId, workDir, options = {}) {
   const file = await bot.getFile(fileId);
   const filePath = file?.file_path;
   if (!filePath) throw new Error("Unable to locate file on Telegram servers.");
 
+  const preferredExt = (options.preferredExt || "").toLowerCase();
+  const detectedExt = path.extname(filePath || "").toLowerCase();
+  const ext = preferredExt || detectedExt;
+
   const localPath = path.join(
     workDir,
-    `${Date.now()}_${crypto.randomBytes(4).toString("hex")}_${path.basename(filePath)}`
+    `${Date.now()}_${crypto.randomBytes(4).toString("hex")}${ext}`
   );
 
   const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
@@ -1315,7 +1319,7 @@ Limit: ${MAX_MB} MB`;
     try {
       const downloadedPaths = [];
       for (const fileId of session.fileIds) {
-        const localPath = await downloadTelegramFile(bot, fileId, workDir);
+        const localPath = await downloadTelegramFile(bot, fileId, workDir, { preferredExt: ".pdf" });
         downloadedPaths.push(localPath);
       }
 
@@ -1361,7 +1365,7 @@ Limit: ${MAX_MB} MB`;
       try {
         const downloadedPaths = [];
         for (const fileId of pending.fileIds) {
-          const localPath = await downloadTelegramFile(bot, fileId, workDir);
+          const localPath = await downloadTelegramFile(bot, fileId, workDir, { preferredExt: ".pdf" });
           downloadedPaths.push(localPath);
         }
 
@@ -1396,7 +1400,7 @@ Limit: ${MAX_MB} MB`;
     const outputPath = path.join(os.tmpdir(), randName(conversion.outputExt));
 
     try {
-      const downloadedPath = await downloadTelegramFile(bot, fileId, workDir);
+      const downloadedPath = await downloadTelegramFile(bot, fileId, workDir, { preferredExt: ext });
 
       await bot.editMessageText(`⚙️ *${conversion.label}*\nPlease wait...`, {
         chat_id: chatId,
