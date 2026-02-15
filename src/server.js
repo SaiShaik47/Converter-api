@@ -1490,17 +1490,25 @@ Pro tip:
       return bot.sendMessage(chatId, `❌ File too large. Max allowed is ${MAX_MB} MB.`);
     }
 
-    if (ext === ".pdf" && msg.media_group_id && target === "merge") {
+    if (ext === ".pdf" && msg.media_group_id) {
       const mediaGroupId = msg.media_group_id;
-      const pending = pendingMediaMerges.get(mediaGroupId) || {
-        chatId,
-        fileIds: [],
-        timer: null
-      };
-      pending.fileIds.push(doc.file_id);
-      pendingMediaMerges.set(mediaGroupId, pending);
-      scheduleMediaMerge(mediaGroupId);
-      return;
+      const existingPending = pendingMediaMerges.get(mediaGroupId);
+      const isMergeRequest = target === "merge" || existingPending?.isMergeRequest;
+
+      if (isMergeRequest) {
+        const pending = existingPending || {
+          chatId,
+          fileIds: [],
+          timer: null,
+          isMergeRequest: false
+        };
+
+        pending.isMergeRequest = true;
+        pending.fileIds.push(doc.file_id);
+        pendingMediaMerges.set(mediaGroupId, pending);
+        scheduleMediaMerge(mediaGroupId);
+        return;
+      }
     }
 
     const options = telegramConversions[ext] || {};
