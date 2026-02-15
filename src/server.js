@@ -597,7 +597,7 @@ async function protectPdf(inputPath, outputPath, password) {
 async function unlockPdf(inputPath, outputPath, password) {
   if (!password) throw new Error("Password is required (example: pass=1234).");
   if (!(await commandAvailable("qpdf"))) throw new Error("Server missing qpdf. Install qpdf to enable protect/unlock.");
-  await runCommand("qpdf", ["--password", password, "--decrypt", "--", inputPath, outputPath]);
+  await runCommand("qpdf", [`--password=${password}`, "--decrypt", "--", inputPath, outputPath]);
 }
 
 /* =========================
