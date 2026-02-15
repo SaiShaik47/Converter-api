@@ -1,10 +1,10 @@
 FROM node:20-bookworm-slim
 
-# Install LibreOffice (Excel->PDF) + Java (Tabula PDF->Excel) + fonts
+# Install LibreOffice (Excel->PDF) + Java (Tabula PDF->Excel) + fonts + qpdf (protect/unlock)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-core libreoffice-calc \
     fonts-dejavu fonts-liberation \
-    default-jre wget \
+    default-jre wget qpdf \
   && rm -rf /var/lib/apt/lists/*
 
 # Download Tabula jar
