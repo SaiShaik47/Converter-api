@@ -703,8 +703,22 @@ async function ocrPdf(inputPath, outputPath, workDir) {
   if (await commandAvailable("ocrmypdf")) {
     const configuredJobs = Number(process.env.OCRMYPDF_JOBS || "1");
     const jobs = Number.isInteger(configuredJobs) && configuredJobs > 0 ? String(configuredJobs) : "1";
-    await runCommand("ocrmypdf", ["--jobs", jobs, "--skip-text", "--optimize", "0", inputPath, outputPath]);
-    return;
+    try {
+      await runCommand("ocrmypdf", [
+        "--jobs", jobs,
+        "--skip-text",
+        "--optimize", "0",
+        "--output-type", "pdf",
+        inputPath,
+        outputPath
+      ]);
+      return;
+    } catch (error) {
+      if (!(await commandAvailable("tesseract"))) {
+        throw error;
+      }
+      // Fall back to tesseract page-by-page OCR if ocrmypdf fails on specific inputs.
+    }
   }
 
   if (!(await commandAvailable("tesseract"))) {
