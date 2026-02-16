@@ -701,8 +701,20 @@ async function unlockPdf(inputPath, outputPath, password) {
 
 async function ocrPdf(inputPath, outputPath, workDir) {
   if (await commandAvailable("ocrmypdf")) {
-    await runCommand("ocrmypdf", ["--skip-text", "--optimize", "1", inputPath, outputPath]);
-    return;
+    try {
+      await runCommand("ocrmypdf", [
+        "--skip-text",
+        "--jobs",
+        "1",
+        "--optimize",
+        "0",
+        inputPath,
+        outputPath
+      ]);
+      return;
+    } catch (err) {
+      // Fallback to per-page tesseract OCR below when ocrmypdf fails
+    }
   }
 
   if (!(await commandAvailable("tesseract"))) {
