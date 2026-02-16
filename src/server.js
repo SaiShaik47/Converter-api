@@ -1466,21 +1466,46 @@ function startTelegramBot() {
   });
 
   const originalSendMessage = bot.sendMessage.bind(bot);
+  const userContextByChat = new Map();
 
-  function escapeLogText(value) {
-    return String(value || "")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 1200);
+  function safe(value, fallback = "") {
+    return value === undefined || value === null ? fallback : String(value);
   }
 
-  function toLogChatTag(chatId) {
-    if (chatId === undefined || chatId === null) return "unknown-chat";
-    return `chat:${chatId}`;
+  function nowISO() {
+    return new Date().toISOString();
+  }
+
+  function getChatLabel(chat) {
+    if (!chat) return "unknown";
+    if (chat.type === "private") return `${safe(chat.username, "private")} (private) ${safe(chat.id)}`;
+    const title = safe(chat.title, safe(chat.username, "group"));
+    return `${title} (${chat.type}) ${safe(chat.id)}`;
+  }
+
+  function getUserLabel(from) {
+    if (!from) return "unknown";
+    const name = [from.first_name, from.last_name].filter(Boolean).join(" ");
+    const uname = from.username ? `@${from.username}` : "";
+    return `${safe(name, "User")} ${uname} ${safe(from.id)}`.trim();
+  }
+
+  function extractInputFromMessage(msg) {
+    if (msg?.text) return msg.text;
+    if (msg?.caption) return msg.caption;
+    return "(non-text update)";
+  }
+
+  function extractContentFromPayload(payload) {
+    if (!payload) return "";
+    if (typeof payload === "string") return payload;
+    if (payload.text) return payload.text;
+    if (payload.caption) return payload.caption;
+    return "";
   }
 
   async function sendToLogChannel(text) {
-    await originalSendMessage(LOG_CHANNEL_ID, `#bot-log\n${text}\nvia ${LOG_CHANNEL_USERNAME}`);
+    await originalSendMessage(LOG_CHANNEL_ID, text, { disable_web_page_preview: true });
   }
 
   async function sendLogMessage(text) {
@@ -1495,24 +1520,83 @@ function startTelegramBot() {
     } catch {}
   }
 
-  bot.sendMessage = async (chatId, text, options) => {
-    const message = await originalSendMessage(chatId, text, options);
+  function wrapBotMethod(methodName) {
+    const originalMethod = bot[methodName].bind(bot);
 
-    if (String(chatId) !== String(LOG_CHANNEL_ID)) {
-      const textValue = escapeLogText(text);
-      await sendLogMessage(`📤 bot_response ${toLogChatTag(chatId)}\ntext:${textValue || "(empty)"}`);
-    }
+    bot[methodName] = async (...args) => {
+      const payloadChatId = args[0]?.chat_id ?? args[0]?.chatId ?? args[0]?.chat;
+      const positionalChatId = methodName === "sendMessage" ? args[0] : undefined;
+      const targetChatId = payloadChatId ?? positionalChatId;
+      const content = methodName === "sendMessage" ? safe(args[1]) : extractContentFromPayload(args[0]);
+      const context = userContextByChat.get(String(targetChatId)) || {};
 
-    return message;
-  };
+      const result = await originalMethod(...args);
+
+      if (String(targetChatId) !== String(LOG_CHANNEL_ID)) {
+        const botResponseLog =
+`🤖 BOT RESPONSE
+👤 User: ${getUserLabel(context.from)}
+💬 Chat: ${context.chat ? getChatLabel(context.chat) : safe(targetChatId, "unknown")}
+🎯 To: ${safe(targetChatId)}
+🧩 Method: ${methodName}
+📝 Content:
+${content || "(no text content)"}`;
+
+        await sendLogMessage(botResponseLog);
+      }
+
+      return result;
+    };
+  }
+
+  [
+    "sendMessage",
+    "editMessageText",
+    "editMessageCaption",
+    "sendDocument",
+    "sendPhoto",
+    "sendVideo",
+    "sendAudio",
+    "sendVoice",
+    "sendAnimation",
+    "sendSticker",
+    "answerCallbackQuery"
+  ].forEach(wrapBotMethod);
 
   bot.on("message", async (msg) => {
     try {
-      const textValue = escapeLogText(msg.text || msg.caption || "");
-      const contentKind = msg.text ? "text" : msg.document ? "document" : msg.photo ? "photo" : "other";
-      await sendLogMessage(
-        `📨 user_message ${toLogChatTag(msg.chat?.id)}\nkind:${contentKind}\ntext:${textValue || "(none)"}`
-      );
+      if (String(msg.chat?.id) === String(LOG_CHANNEL_ID)) return;
+
+      userContextByChat.set(String(msg.chat?.id), { chat: msg.chat, from: msg.from });
+
+      const commandLog =
+`📩 COMMAND
+👤 User: ${getUserLabel(msg.from)}
+💬 Chat: ${getChatLabel(msg.chat)}
+🕒 Time: ${nowISO()}
+🧾 Input:
+${extractInputFromMessage(msg)}`;
+
+      await sendLogMessage(commandLog);
+    } catch {}
+  });
+
+  bot.on("callback_query", async (query) => {
+    try {
+      const chat = query.message?.chat;
+      if (String(chat?.id) === String(LOG_CHANNEL_ID)) return;
+
+      userContextByChat.set(String(chat?.id), { chat, from: query.from });
+
+      const commandLog =
+`📩 COMMAND
+👤 User: ${getUserLabel(query.from)}
+💬 Chat: ${getChatLabel(chat)}
+🕒 Time: ${nowISO()}
+🧾 Input:
+callback: ${safe(query.data, "(none)")}`;
+
+      await sendLogMessage(commandLog);
     } catch {}
   });
 
