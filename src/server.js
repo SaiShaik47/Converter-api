@@ -499,10 +499,106 @@ async function imageToPdf(imagePath, pdfPath) {
   });
 }
 
+async function imagesToPdf(imagePaths, pdfPath) {
+  if (!imagePaths.length) throw new Error("No images provided.");
+
+  await new Promise((resolve, reject) => {
+    const doc = new PDFKitDocument({ autoFirstPage: false, margin: 0 });
+    const stream = createWriteStream(pdfPath);
+
+    doc.on("error", reject);
+    stream.on("error", reject);
+    stream.on("finish", resolve);
+
+    doc.pipe(stream);
+
+    for (const imagePath of imagePaths) {
+      const image = doc.openImage(imagePath);
+      doc.addPage({ size: [image.width, image.height], margin: 0 });
+      doc.image(imagePath, 0, 0, { width: image.width, height: image.height });
+    }
+
+    doc.end();
+  });
+}
+
+async function getPdfProtectionStatus(inputPath) {
+  if (await commandAvailable("qpdf")) {
+    try {
+      const { stdout } = await runCommand("qpdf", ["--show-encryption", inputPath]);
+      return !/File is not encrypted/i.test(stdout);
+    } catch {
+      // fall through to JS check
+    }
+  }
+
+  try {
+    const bytes = await fs.readFile(inputPath);
+    await PDFDocument.load(bytes);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
 function parsePageRangesInput(pagesValue, totalPages) {
   if (!pagesValue || pagesValue.toLowerCase() === "all") {
     return Array.from({ length: totalPages }, (_, idx) => [idx]);
   }
+
+  const normalized = pagesValue.toLowerCase().trim();
+  const everyMatch = normalized.match(/(?:every|chunk)\s*[=:]\s*(\d+)/i);
+  if (everyMatch) {
+    const chunkSize = Number(everyMatch[1]);
+    if (chunkSize > 0) {
+      const chunks = [];
+      for (let start = 0; start < totalPages; start += chunkSize) {
+        const pages = [];
+        for (let i = start; i < Math.min(start + chunkSize, totalPages); i += 1) pages.push(i);
+        chunks.push(pages);
+      }
+      return chunks;
+    }
+  }
+
+  const fromMatch = normalized.match(/from\s*[=:]\s*(\d+)/i);
+  if (fromMatch) {
+    const fromPage = Math.min(totalPages, Math.max(2, Number(fromMatch[1])));
+    return [
+      Array.from({ length: fromPage - 1 }, (_, idx) => idx),
+      Array.from({ length: totalPages - fromPage + 1 }, (_, idx) => idx + fromPage - 1)
+    ].filter(group => group.length > 0);
+  }
+
+  const explicitGroups = pagesValue.includes("|") || pagesValue.includes(";")
+    ? pagesValue.split(/[|;]/).map(group => group.trim()).filter(Boolean)
+    : [pagesValue];
+
+  const groupedRanges = [];
+
+  for (const groupText of explicitGroups) {
+    const group = [];
+    const parts = groupText.split(",").map(part => part.trim()).filter(Boolean);
+
+    for (const part of parts) {
+      const rangeMatch = part.match(/^(\d+)\s*-\s*(\d+)$/);
+      if (rangeMatch) {
+        const start = Math.max(1, Number(rangeMatch[1]));
+        const end = Math.min(totalPages, Number(rangeMatch[2]));
+        if (Number.isNaN(start) || Number.isNaN(end)) continue;
+        for (let i = Math.min(start, end); i <= Math.max(start, end); i += 1) {
+          group.push(i - 1);
+        }
+      } else {
+        const pageNum = Number(part);
+        if (!Number.isNaN(pageNum) && pageNum >= 1 && pageNum <= totalPages) group.push(pageNum - 1);
+      }
+    }
+
+    if (group.length) groupedRanges.push(Array.from(new Set(group)));
+  }
+
+  if (groupedRanges.length) return groupedRanges;
 
   const ranges = [];
   const parts = pagesValue.split(",").map(part => part.trim()).filter(Boolean);
@@ -590,14 +686,103 @@ async function compressPdf(inputPath, outputPath) {
 
 async function protectPdf(inputPath, outputPath, password) {
   if (!password) throw new Error("Password is required (example: password=1234).");
+  if (await getPdfProtectionStatus(inputPath)) throw new Error("This PDF already has a password.");
   if (!(await commandAvailable("qpdf"))) throw new Error("Server missing qpdf. Install qpdf to enable protect/unlock.");
   await runCommand("qpdf", ["--encrypt", password, password, "256", "--", inputPath, outputPath]);
 }
 
 async function unlockPdf(inputPath, outputPath, password) {
+  const isProtected = await getPdfProtectionStatus(inputPath);
+  if (!isProtected) throw new Error("This PDF has no password to unlock.");
   if (!password) throw new Error("Password is required (example: pass=1234).");
   if (!(await commandAvailable("qpdf"))) throw new Error("Server missing qpdf. Install qpdf to enable protect/unlock.");
   await runCommand("qpdf", [`--password=${password}`, "--decrypt", "--", inputPath, outputPath]);
+}
+
+async function ocrPdf(inputPath, outputPath, workDir) {
+  if (await commandAvailable("ocrmypdf")) {
+    await runCommand("ocrmypdf", ["--skip-text", "--optimize", "1", inputPath, outputPath]);
+    return;
+  }
+
+  if (!(await commandAvailable("tesseract"))) {
+    throw new Error("OCR requires ocrmypdf or tesseract installed on the server.");
+  }
+
+  const imagePaths = await renderPdfToPngs(inputPath, workDir);
+  const ocrPagePdfs = [];
+
+  for (let i = 0; i < imagePaths.length; i += 1) {
+    const pagePdf = path.join(workDir, `ocr-page-${i + 1}.pdf`);
+    await runCommand("tesseract", [imagePaths[i], pagePdf.replace(/\.pdf$/i, ""), "pdf"]);
+    ocrPagePdfs.push(pagePdf);
+  }
+
+  await mergePdfs(ocrPagePdfs, outputPath);
+}
+
+const TRANSLATION_LANGUAGES = {
+  ar: "Arabic",
+  bn: "Bengali",
+  de: "German",
+  en: "English",
+  es: "Spanish",
+  fr: "French",
+  hi: "Hindi",
+  id: "Indonesian",
+  it: "Italian",
+  ja: "Japanese",
+  ko: "Korean",
+  pt: "Portuguese",
+  ru: "Russian",
+  tr: "Turkish",
+  ur: "Urdu",
+  zh: "Chinese"
+};
+
+async function translateText(text, targetLanguage) {
+  const url = process.env.LIBRETRANSLATE_URL || "https://libretranslate.com/translate";
+  const apiKey = process.env.LIBRETRANSLATE_API_KEY || "";
+
+  const chunks = text.match(/[\s\S]{1,1800}/g) || [""];
+  const translatedChunks = [];
+
+  for (const chunk of chunks) {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        q: chunk,
+        source: "auto",
+        target: targetLanguage,
+        format: "text",
+        api_key: apiKey || undefined
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`Translation service failed with status ${response.status}`);
+    }
+
+    const payload = await response.json();
+    translatedChunks.push(payload.translatedText || "");
+  }
+
+  return translatedChunks.join("");
+}
+
+async function translatePdf(inputPath, outputPath, targetLanguage) {
+  if (!TRANSLATION_LANGUAGES[targetLanguage]) {
+    throw new Error("Unsupported language selected.");
+  }
+
+  const raw = await fs.readFile(inputPath);
+  const parsed = await pdfParse(raw);
+  const text = (parsed.text || "").trim();
+  if (!text) throw new Error("No text found in PDF. Run OCR first for scanned PDFs.");
+
+  const translated = await translateText(text, targetLanguage);
+  await writeTextPdf(translated.split(/\r?\n/), outputPath);
 }
 
 /* =========================
@@ -627,7 +812,11 @@ app.get("/", (req, res) => {
       pdf_split: "POST /pdf-split?pages=1-3,5 (form-data key: file)",
       pdf_compress: "POST /pdf-compress (form-data key: file)",
       pdf_protect: "POST /pdf-protect (form-data key: file, field: password)",
-      pdf_unlock: "POST /pdf-unlock (form-data key: file, field: password)"
+      pdf_unlock: "POST /pdf-unlock (form-data key: file, field: password)",
+      pdf_ocr: "POST /pdf-ocr (form-data key: file)",
+      scan_to_pdf: "POST /scan-to-pdf (form-data key: files[])",
+      pdf_translate: "POST /pdf-translate?lang=es (form-data key: file)",
+      available_translate_languages: TRANSLATION_LANGUAGES
     },
     limits: { max_upload_mb: MAX_MB }
   });
@@ -881,14 +1070,86 @@ app.post("/pdf-to-images", upload.single("file"), async (req, res) => {
 
 app.post("/image-to-pdf", upload.single("file"), async (req, res) => {
   await handleFileConversion(req, res, {
-    allowedExts: [".jpg", ".jpeg", ".png", ".tiff", ".bmp"],
-    invalidExtMessage: "Only .jpg, .jpeg, .png, .tiff, or .bmp allowed",
+    allowedExts: [".jpg", ".jpeg", ".png", ".tiff", ".bmp", ".webp", ".gif"],
+    invalidExtMessage: "Only image files allowed (.jpg, .jpeg, .png, .tiff, .bmp, .webp, .gif)",
     workPrefix: "i2p-",
     contentType: "application/pdf",
     outputName: "output.pdf",
     convert: async (inputPath, workDir) => {
       const outPath = path.join(workDir, "output.pdf");
       await imageToPdf(inputPath, outPath);
+      return outPath;
+    }
+  });
+});
+
+app.post("/scan-to-pdf", upload.array("files", 50), async (req, res) => {
+  const files = req.files || [];
+  if (!Array.isArray(files) || files.length === 0) {
+    return res.status(400).json({ ok: false, error: "Upload image files using key: files[]" });
+  }
+
+  const allowed = [".jpg", ".jpeg", ".png", ".tiff", ".bmp", ".webp", ".gif"];
+  const inputPaths = files.map(file => file.path);
+  const invalid = files.find(file => !allowed.includes(path.extname(file.originalname || "").toLowerCase()));
+  if (invalid) {
+    await Promise.all(inputPaths.map(safeUnlink));
+    return res.status(400).json({ ok: false, error: "Only image files are allowed for scan-to-pdf" });
+  }
+
+  const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "scan2pdf-"));
+  let cleaned = false;
+
+  const cleanup = async () => {
+    if (cleaned) return;
+    cleaned = true;
+    await Promise.all(inputPaths.map(safeUnlink));
+    await safeRmDir(workDir);
+  };
+
+  try {
+    const outPath = path.join(workDir, "scanned.pdf");
+    await imagesToPdf(inputPaths, outPath);
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", 'attachment; filename="scanned.pdf"');
+    createReadStream(outPath).pipe(res);
+
+    res.on("finish", cleanup);
+    res.on("close", cleanup);
+  } catch (e) {
+    await cleanup();
+    res.status(500).json({ ok: false, error: e.message || "Scan to PDF failed" });
+  }
+});
+
+app.post("/pdf-ocr", upload.single("file"), async (req, res) => {
+  await handleFileConversion(req, res, {
+    allowedExts: [".pdf"],
+    invalidExtMessage: "Only .pdf allowed",
+    workPrefix: "pocr-",
+    contentType: "application/pdf",
+    outputName: "searchable.pdf",
+    convert: async (inputPath, workDir) => {
+      const outPath = path.join(workDir, "searchable.pdf");
+      await ocrPdf(inputPath, outPath, workDir);
+      return outPath;
+    }
+  });
+});
+
+app.post("/pdf-translate", upload.single("file"), async (req, res) => {
+  const targetLanguage = (req.query.lang || req.body?.lang || "en").toString().toLowerCase();
+
+  await handleFileConversion(req, res, {
+    allowedExts: [".pdf"],
+    invalidExtMessage: "Only .pdf allowed",
+    workPrefix: "ptrans-",
+    contentType: "application/pdf",
+    outputName: `translated-${targetLanguage}.pdf`,
+    convert: async (inputPath, workDir) => {
+      const outPath = path.join(workDir, `translated-${targetLanguage}.pdf`);
+      await translatePdf(inputPath, outPath, targetLanguage);
       return outPath;
     }
   });
@@ -1039,10 +1300,11 @@ Send a file and I’ll auto-detect everything you can do with it.
 You’ll get smart buttons for every supported tool.
 
 ✨ Quick Examples:
-• Send invoice.pdf → tap Split / Compress / Protect / Unlock
+• Send invoice.pdf → tap OCR / Split / Compress / Protect / Unlock
 • Send report.pdf with caption: to docx
 • Send 2+ PDFs together with caption: merge
 • Tap Protect/Unlock → send password when asked
+• Scan mode: /scanpdf → send images → /done
 
 📦 Limits:
 • Max file size: ${MAX_MB} MB
@@ -1056,6 +1318,9 @@ You’ll get smart buttons for every supported tool.
 /cancel   - cancel merge mode
 /split    - split PDF pages
 /compress - compress PDF
+/ocr      - OCR scanned PDF
+/translate- translate PDF language
+/scanpdf  - merge images into one PDF
 /protect  - protect PDF (password)
 /unlock   - unlock PDF (password)
 `;
@@ -1076,8 +1341,15 @@ You’ll get smart buttons for every supported tool.
 
   function parsePages(caption) {
     if (!caption) return null;
-    const match = caption.match(/(?:pages|split)[:=\s]+([0-9,\s-]+)/i);
+    const match = caption.match(/(?:pages|split)[:=\s]+([a-z0-9,\s|;:=\-]+)/i);
     return match ? match[1].replace(/\s+/g, "") : null;
+  }
+
+  function parseLanguage(caption) {
+    if (!caption) return null;
+    const match = caption.match(/(?:lang|language)[:=\s]+([a-z]{2})/i);
+    const lang = match ? match[1].toLowerCase() : null;
+    return lang && TRANSLATION_LANGUAGES[lang] ? lang : null;
   }
 
   const telegramConversions = {
@@ -1129,6 +1401,17 @@ You’ll get smart buttons for every supported tool.
       compress: { label: "PDF → Compressed PDF", outputExt: ".pdf", convert: async (input, dir) => {
         const outPath = path.join(dir, "compressed.pdf");
         await compressPdf(input, outPath);
+        return outPath;
+      }},
+      ocr: { label: "PDF → OCR (Searchable)", outputExt: ".pdf", convert: async (input, dir) => {
+        const outPath = path.join(dir, "searchable.pdf");
+        await ocrPdf(input, outPath, dir);
+        return outPath;
+      }},
+      translate: { label: "PDF → Translate", outputExt: ".pdf", needsLanguage: true, convert: async (input, dir, context = {}) => {
+        const lang = (context.language || "en").toLowerCase();
+        const outPath = path.join(dir, `translated-${lang}.pdf`);
+        await translatePdf(input, outPath, lang);
         return outPath;
       }},
       split: { label: "PDF → Split (ZIP)", outputExt: ".zip", convert: async (input, dir, context = {}) => {
@@ -1199,6 +1482,16 @@ You’ll get smart buttons for every supported tool.
       const outPath = path.join(dir, "output.pdf");
       await imageToPdf(input, outPath);
       return outPath;
+    }}},
+    ".webp": { pdf: { label: "Image → PDF", outputExt: ".pdf", convert: async (input, dir) => {
+      const outPath = path.join(dir, "output.pdf");
+      await imageToPdf(input, outPath);
+      return outPath;
+    }}},
+    ".gif": { pdf: { label: "Image → PDF", outputExt: ".pdf", convert: async (input, dir) => {
+      const outPath = path.join(dir, "output.pdf");
+      await imageToPdf(input, outPath);
+      return outPath;
     }}}
   };
 
@@ -1206,9 +1499,11 @@ You’ll get smart buttons for every supported tool.
   const pendingMediaMerges = new Map();
   const pendingPasswordActions = new Map(); // chatId -> { conversion, fileId, ext, target, mode }
   const pendingCommandFileActions = new Map(); // chatId -> { target }
+  const pendingTranslationActions = new Map(); // chatId -> { fileId, ext, mode }
 
   // ✅ Step-by-step merge mode
   const mergeSessions = new Map(); // chatId -> { fileIds: [], startedAt: Date.now() }
+  const scanToPdfSessions = new Map(); // chatId -> { imageFileIds: [], startedAt: Date.now() }
 
   function formatSupportedConversions(conversions) {
     const lines = [];
@@ -1253,7 +1548,9 @@ Convert:
 • to pdf / to docx / to xlsx / to txt / to csv / to json
 PDF tools:
 • to compress
-• to split pages=1-3,5
+• to ocr
+• to split pages=1-3,5 OR pages=from:4 OR pages=every:2
+• to translate lang=es
 • to protect (then send password when asked)
 • to unlock (then send password when asked)
 
@@ -1265,10 +1562,13 @@ PDF tools:
 ✅ B) Step mode:
 /merge → send PDFs one by one → /done
 
-4) Supported types
+4) Scan to PDF
+• /scanpdf → send images one by one → /done
+
+5) Supported types
 ${formatSupportedConversions(telegramConversions)}
 
-Limit: ${MAX_MB} MB`;
+Languages for translate: ${Object.entries(TRANSLATION_LANGUAGES).map(([k, v]) => `${k}(${v})`).join(", ")}\n\nLimit: ${MAX_MB} MB`;
 
   bot.setMyCommands([
     { command: "start", description: "Welcome" },
@@ -1279,6 +1579,9 @@ Limit: ${MAX_MB} MB`;
     { command: "cancel", description: "Cancel merge mode" },
     { command: "split", description: "Split a PDF into pages" },
     { command: "compress", description: "Compress a PDF" },
+    { command: "ocr", description: "OCR a scanned PDF" },
+    { command: "translate", description: "Translate a PDF" },
+    { command: "scanpdf", description: "Build one PDF from images" },
     { command: "protect", description: "Password-protect a PDF" },
     { command: "unlock", description: "Unlock a PDF" }
   ]);
@@ -1286,8 +1589,17 @@ Limit: ${MAX_MB} MB`;
   bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, startText));
   bot.onText(/\/help/, (msg) => bot.sendMessage(msg.chat.id, helpText));
   bot.onText(/\/status/, (msg) => bot.sendMessage(msg.chat.id, "✅ Bot is running. Send a file."));
-  bot.onText(/\/split/, (msg) => bot.sendMessage(msg.chat.id, "✂️ Split: Send a PDF and tap “Split (ZIP)” or caption: to split pages=1-3,5"));
+  bot.onText(/\/split/, (msg) => bot.sendMessage(msg.chat.id, "✂️ Split: Send PDF and use caption examples: pages=1-3,5 OR pages=from:4 OR pages=every:2"));
   bot.onText(/\/compress/, (msg) => bot.sendMessage(msg.chat.id, "🗜️ Compress: Send a PDF and tap “Compressed PDF” or caption: to compress"));
+  bot.onText(/\/ocr/, (msg) => bot.sendMessage(msg.chat.id, "🔎 OCR: Send a scanned PDF and tap “PDF → OCR (Searchable)”."));
+  bot.onText(/\/translate/, (msg) => {
+    pendingCommandFileActions.set(msg.chat.id, { target: "translate" });
+    bot.sendMessage(msg.chat.id, "🌍 Translate mode: send a PDF first. Then send a language code like en, es, fr, de, ar, hi.");
+  });
+  bot.onText(/\/scanpdf/, (msg) => {
+    scanToPdfSessions.set(msg.chat.id, { imageFileIds: [], startedAt: Date.now() });
+    bot.sendMessage(msg.chat.id, "🖼️ Scan to PDF mode ON.\nSend images one by one.\nWhen finished, type /done\nTo cancel: /cancel");
+  });
   bot.onText(/\/protect/, (msg) => {
     pendingCommandFileActions.set(msg.chat.id, { target: "protect" });
     bot.sendMessage(msg.chat.id, "🔒 Protect mode: Please send the PDF file first.");
@@ -1307,13 +1619,47 @@ Limit: ${MAX_MB} MB`;
 
   bot.onText(/\/cancel/, (msg) => {
     mergeSessions.delete(msg.chat.id);
-    bot.sendMessage(msg.chat.id, "❌ Merge mode cancelled.");
+    scanToPdfSessions.delete(msg.chat.id);
+    bot.sendMessage(msg.chat.id, "❌ Active batch mode cancelled.");
   });
 
   bot.onText(/\/done/, async (msg) => {
     const chatId = msg.chat.id;
+
+    const scanSession = scanToPdfSessions.get(chatId);
+    if (scanSession) {
+      scanToPdfSessions.delete(chatId);
+      if (scanSession.imageFileIds.length === 0) return bot.sendMessage(chatId, "❌ No images collected. Use /scanpdf again.");
+
+      const status = await bot.sendMessage(chatId, "⏳ Building PDF from images...");
+      const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "tg-scan2pdf-"));
+      const outputPath = path.join(os.tmpdir(), randName(".pdf"));
+
+      try {
+        const imagePaths = [];
+        for (const fileId of scanSession.imageFileIds) {
+          const localPath = await downloadTelegramFile(bot, fileId, workDir);
+          imagePaths.push(localPath);
+        }
+
+        await imagesToPdf(imagePaths, outputPath);
+        await bot.editMessageText("✅ Done: Scan to PDF\nUploading result...", {
+          chat_id: chatId,
+          message_id: status.message_id
+        });
+
+        await bot.sendDocument(chatId, outputPath, { caption: "✅ Scan to PDF" });
+      } catch (e) {
+        await bot.sendMessage(chatId, `❌ Scan to PDF failed.\nReason: ${e.message}`);
+      } finally {
+        await safeUnlink(outputPath);
+        await safeRmDir(workDir);
+      }
+      return;
+    }
+
     const session = mergeSessions.get(chatId);
-    if (!session) return bot.sendMessage(chatId, "No active merge. Use /merge first.");
+    if (!session) return bot.sendMessage(chatId, "No active merge or scan session. Use /merge or /scanpdf first.");
 
     mergeSessions.delete(chatId);
 
@@ -1439,6 +1785,22 @@ Limit: ${MAX_MB} MB`;
     }
   }
 
+  bot.on("photo", async (msg) => {
+    const chatId = msg.chat.id;
+    const scanSession = scanToPdfSessions.get(chatId);
+    if (!scanSession) return;
+
+    const photos = msg.photo || [];
+    const best = photos[photos.length - 1];
+    if (!best?.file_id) return;
+
+    scanSession.imageFileIds.push(best.file_id);
+    scanToPdfSessions.set(chatId, scanSession);
+    await bot.sendMessage(chatId, `✅ Added image
+Total images: ${scanSession.imageFileIds.length}
+Send more or type /done`);
+  });
+
   bot.on("document", async (msg) => {
     const chatId = msg.chat.id;
     const doc = msg.document;
@@ -1449,6 +1811,16 @@ Limit: ${MAX_MB} MB`;
 
     const size = doc.file_size || 0;
     if (size > MAX_BYTES) return bot.sendMessage(chatId, `❌ File too large. Max ${MAX_MB} MB.`);
+
+    const scanSession = scanToPdfSessions.get(chatId);
+    const scanImageExts = [".jpg", ".jpeg", ".png", ".tiff", ".bmp", ".webp", ".gif"];
+    if (scanSession && scanImageExts.includes(ext)) {
+      scanSession.imageFileIds.push(doc.file_id);
+      scanToPdfSessions.set(chatId, scanSession);
+      return bot.sendMessage(chatId, `✅ Added image: ${fileName}
+Total images: ${scanSession.imageFileIds.length}
+Send more or type /done`);
+    }
 
     const pendingFileAction = pendingCommandFileActions.get(chatId);
     if (pendingFileAction) {
@@ -1461,14 +1833,37 @@ Limit: ${MAX_MB} MB`;
       }
 
       pendingCommandFileActions.delete(chatId);
-      pendingPasswordActions.set(chatId, {
+
+      if (conversion.needsPassword) {
+        pendingPasswordActions.set(chatId, {
+          conversion,
+          fileId: doc.file_id,
+          ext,
+          target: pendingFileAction.target,
+          mode: "command"
+        });
+        return bot.sendMessage(chatId, `🔐 Send password to ${pendingFileAction.target} this PDF.`);
+      }
+
+      if (conversion.needsLanguage) {
+        pendingTranslationActions.set(chatId, {
+          conversion,
+          fileId: doc.file_id,
+          ext,
+          target: pendingFileAction.target,
+          mode: "command"
+        });
+        return bot.sendMessage(chatId, `🌍 Send language code (${Object.keys(TRANSLATION_LANGUAGES).join(", ")}).`);
+      }
+
+      await performConversion({
+        chatId,
         conversion,
         fileId: doc.file_id,
         ext,
-        target: pendingFileAction.target,
-        mode: "command"
+        resolvedTarget: pendingFileAction.target
       });
-      return bot.sendMessage(chatId, `🔐 Send password to ${pendingFileAction.target} this PDF.`);
+      return;
     }
 
     // Step merge mode: collect PDFs
@@ -1482,6 +1877,7 @@ Limit: ${MAX_MB} MB`;
     const target = parseTarget(msg.caption);
     const password = parsePassword(msg.caption);
     const pages = parsePages(msg.caption);
+    const language = parseLanguage(msg.caption);
 
     // Media-group merge mode
     if (ext === ".pdf" && msg.media_group_id && target === "merge") {
@@ -1502,7 +1898,7 @@ Limit: ${MAX_MB} MB`;
     if (supportedTargets.length === 0) {
       return bot.sendMessage(
         chatId,
-        "❌ Unsupported file type.\nSend: PDF, DOCX, PPTX, XLSX, CSV, JSON, TXT, JPG/PNG/BMP."
+        "❌ Unsupported file type.\nSend: PDF, DOCX, PPTX, XLSX, CSV, JSON, TXT, and common image files."
       );
     }
 
@@ -1534,13 +1930,24 @@ Limit: ${MAX_MB} MB`;
       return bot.sendMessage(chatId, `🔐 Send password to ${target} this PDF.`);
     }
 
+    if (conversion.needsLanguage && !language) {
+      pendingTranslationActions.set(chatId, {
+        conversion,
+        fileId: doc.file_id,
+        ext,
+        target,
+        mode: "caption"
+      });
+      return bot.sendMessage(chatId, `🌍 Send language code (${Object.keys(TRANSLATION_LANGUAGES).join(", ")}).`);
+    }
+
     await performConversion({
       chatId,
       conversion,
       fileId: doc.file_id,
       ext,
       resolvedTarget: target,
-      context: { password, pages }
+      context: { password, pages, language }
     });
   });
 
@@ -1570,6 +1977,7 @@ Limit: ${MAX_MB} MB`;
     const caption = query.message?.caption || query.message?.text || "";
     const password = parsePassword(caption);
     const pages = parsePages(caption);
+    const language = parseLanguage(caption);
 
     if (conversion.needsPassword && !password) {
       pendingPasswordActions.set(pending.chatId, {
@@ -1584,6 +1992,19 @@ Limit: ${MAX_MB} MB`;
       return;
     }
 
+    if (conversion.needsLanguage && !language) {
+      pendingTranslationActions.set(pending.chatId, {
+        conversion,
+        fileId: pending.fileId,
+        ext: pending.ext,
+        target,
+        mode: "button"
+      });
+      await bot.answerCallbackQuery(query.id, { text: "Send language code in chat" });
+      await bot.sendMessage(pending.chatId, `🌍 Send language code (${Object.keys(TRANSLATION_LANGUAGES).join(", ")}).`);
+      return;
+    }
+
     await bot.answerCallbackQuery(query.id, { text: `Starting ${conversion.label}...` });
 
     await performConversion({
@@ -1592,7 +2013,7 @@ Limit: ${MAX_MB} MB`;
       fileId: pending.fileId,
       ext: pending.ext,
       resolvedTarget: target,
-      context: { password, pages }
+      context: { password, pages, language }
     });
   });
 
@@ -1601,6 +2022,26 @@ Limit: ${MAX_MB} MB`;
     const chatId = msg.chat.id;
     const text = (msg.text || "").trim();
     if (!text || text.startsWith("/")) return;
+
+    const pendingTranslation = pendingTranslationActions.get(chatId);
+    if (pendingTranslation) {
+      const language = text.toLowerCase();
+      if (!TRANSLATION_LANGUAGES[language]) {
+        await bot.sendMessage(chatId, `❌ Invalid language code. Use one of: ${Object.keys(TRANSLATION_LANGUAGES).join(", ")}`);
+        return;
+      }
+
+      pendingTranslationActions.delete(chatId);
+      await performConversion({
+        chatId,
+        conversion: pendingTranslation.conversion,
+        fileId: pendingTranslation.fileId,
+        ext: pendingTranslation.ext,
+        resolvedTarget: pendingTranslation.target,
+        context: { language }
+      });
+      return;
+    }
 
     const pendingAction = pendingPasswordActions.get(chatId);
     if (!pendingAction) return;
