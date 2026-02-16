@@ -701,7 +701,9 @@ async function unlockPdf(inputPath, outputPath, password) {
 
 async function ocrPdf(inputPath, outputPath, workDir) {
   if (await commandAvailable("ocrmypdf")) {
-    await runCommand("ocrmypdf", ["--skip-text", "--optimize", "1", inputPath, outputPath]);
+    const configuredJobs = Number(process.env.OCRMYPDF_JOBS || "1");
+    const jobs = Number.isInteger(configuredJobs) && configuredJobs > 0 ? String(configuredJobs) : "1";
+    await runCommand("ocrmypdf", ["--jobs", jobs, "--skip-text", "--optimize", "0", inputPath, outputPath]);
     return;
   }
 
@@ -1502,6 +1504,7 @@ You’ll get smart buttons for every supported tool.
   const pendingTranslationActions = new Map(); // chatId -> { fileId, ext, mode }
   const pendingSplitActions = new Map(); // chatId -> { fileId, ext, mode, pagesInput, stage }
   const pendingRenameActions = new Map(); // chatId -> { outputPath, conversionLabel, outputExt, requestedBaseName, stage, showPdfToXlsxTip }
+  const pendingRenameFileActions = new Map(); // chatId -> { active: true }
 
   // ✅ Step-by-step merge mode
   const mergeSessions = new Map(); // chatId -> { fileIds: [], startedAt: Date.now() }
@@ -1647,6 +1650,11 @@ After any conversion:
 • Bot asks for output filename
 • Bot asks confirmation before sending renamed file
 
+Rename any file:
+• /rename → send any file
+• send new filename (without extension)
+• confirm, then bot sends renamed file
+
 3) Merge PDFs (2 ways)
 ✅ A) Media group:
 • Send 2+ PDFs together
@@ -1675,6 +1683,7 @@ Languages for translate: ${Object.entries(TRANSLATION_LANGUAGES).map(([k, v]) =>
     { command: "ocr", description: "OCR a scanned PDF" },
     { command: "translate", description: "Translate a PDF" },
     { command: "scanpdf", description: "Build one PDF from images" },
+    { command: "rename", description: "Rename any file and resend it" },
     { command: "protect", description: "Password-protect a PDF" },
     { command: "unlock", description: "Unlock a PDF" }
   ]);
@@ -1699,6 +1708,10 @@ Languages for translate: ${Object.entries(TRANSLATION_LANGUAGES).map(([k, v]) =>
     scanToPdfSessions.set(msg.chat.id, { imageFileIds: [], startedAt: Date.now() });
     bot.sendMessage(msg.chat.id, "🖼️ Scan to PDF mode ON.\nSend images one by one.\nWhen finished, type /done\nTo cancel: /cancel");
   });
+  bot.onText(/\/rename/, (msg) => {
+    pendingRenameFileActions.set(msg.chat.id, { active: true });
+    bot.sendMessage(msg.chat.id, "✏️ Rename mode: send any file now. I'll ask the new filename and confirm before sending.");
+  });
   bot.onText(/\/protect/, (msg) => {
     pendingCommandFileActions.set(msg.chat.id, { target: "protect" });
     bot.sendMessage(msg.chat.id, "🔒 Protect mode: Please send the PDF file first.");
@@ -1720,6 +1733,7 @@ Languages for translate: ${Object.entries(TRANSLATION_LANGUAGES).map(([k, v]) =>
     mergeSessions.delete(msg.chat.id);
     scanToPdfSessions.delete(msg.chat.id);
     pendingSplitActions.delete(msg.chat.id);
+    pendingRenameFileActions.delete(msg.chat.id);
     const pendingRename = pendingRenameActions.get(msg.chat.id);
     if (pendingRename?.timer) clearTimeout(pendingRename.timer);
     if (pendingRename?.outputPath) safeUnlink(pendingRename.outputPath);
@@ -2001,6 +2015,62 @@ Send more or type /done`);
         ext,
         resolvedTarget: pendingFileAction.target
       });
+      return;
+    }
+
+    const pendingRenameFile = pendingRenameFileActions.get(chatId);
+    if (pendingRenameFile?.active) {
+      pendingRenameFileActions.delete(chatId);
+
+      const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "tg-rename-"));
+      let outputPath = "";
+
+      try {
+        const localFilePath = await downloadTelegramFile(bot, doc.file_id, workDir);
+        const safeExt = path.extname(fileName).toLowerCase() || path.extname(localFilePath).toLowerCase();
+        const outputExt = safeExt || ".bin";
+        outputPath = path.join(os.tmpdir(), randName(outputExt));
+        await fs.copyFile(localFilePath, outputPath);
+
+        const defaultBaseName = sanitizeOutputBaseName(path.basename(fileName, path.extname(fileName)) || "renamed-file") || "renamed-file";
+
+        const renamePrompt = await bot.sendMessage(
+          chatId,
+          `📎 File received: *${fileName}*\nSend the new filename without extension. I will keep ${outputExt}.`,
+          { parse_mode: "Markdown" }
+        );
+
+        const existingRename = pendingRenameActions.get(chatId);
+        if (existingRename?.timer) clearTimeout(existingRename.timer);
+        if (existingRename?.outputPath) await safeUnlink(existingRename.outputPath);
+
+        const timer = setTimeout(async () => {
+          const autoSent = await flushRenameOutput(chatId, defaultBaseName);
+          if (autoSent) {
+            await bot.sendMessage(chatId, `⏱️ No name received in time. Sent with default name: ${defaultBaseName}${outputExt}`);
+          }
+        }, 90 * 1000);
+
+        pendingRenameActions.set(chatId, {
+          outputPath,
+          conversionLabel: "Renamed file",
+          outputExt,
+          requestedBaseName: defaultBaseName,
+          stage: "awaiting_name",
+          messageId: renamePrompt.message_id,
+          timer,
+          contentType: doc.mime_type || "application/octet-stream",
+          showPdfToXlsxTip: false
+        });
+
+        outputPath = "";
+      } catch (e) {
+        await bot.sendMessage(chatId, `❌ Rename setup failed.\nReason: ${e.message}`);
+      } finally {
+        if (outputPath) await safeUnlink(outputPath);
+        await safeRmDir(workDir);
+      }
+
       return;
     }
 
