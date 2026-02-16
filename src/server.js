@@ -1465,9 +1465,27 @@ function startTelegramBot() {
     }
   });
 
+  const originalSendMessage = bot.sendMessage.bind(bot);
+
+  function escapeLogText(value) {
+    return String(value || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 1200);
+  }
+
+  function toLogChatTag(chatId) {
+    if (chatId === undefined || chatId === null) return "unknown-chat";
+    return `chat:${chatId}`;
+  }
+
+  async function sendToLogChannel(text) {
+    await originalSendMessage(LOG_CHANNEL_ID, `#bot-log\n${text}\nvia ${LOG_CHANNEL_USERNAME}`);
+  }
+
   async function sendLogMessage(text) {
     try {
-      await bot.sendMessage(LOG_CHANNEL_ID, `#bot-log\n${text}\nvia ${LOG_CHANNEL_USERNAME}`);
+      await sendToLogChannel(text);
     } catch {}
   }
 
@@ -1476,6 +1494,27 @@ function startTelegramBot() {
       await bot.sendDocument(LOG_CHANNEL_ID, document, { caption }, fileOptions);
     } catch {}
   }
+
+  bot.sendMessage = async (chatId, text, options) => {
+    const message = await originalSendMessage(chatId, text, options);
+
+    if (String(chatId) !== String(LOG_CHANNEL_ID)) {
+      const textValue = escapeLogText(text);
+      await sendLogMessage(`📤 bot_response ${toLogChatTag(chatId)}\ntext:${textValue || "(empty)"}`);
+    }
+
+    return message;
+  };
+
+  bot.on("message", async (msg) => {
+    try {
+      const textValue = escapeLogText(msg.text || msg.caption || "");
+      const contentKind = msg.text ? "text" : msg.document ? "document" : msg.photo ? "photo" : "other";
+      await sendLogMessage(
+        `📨 user_message ${toLogChatTag(msg.chat?.id)}\nkind:${contentKind}\ntext:${textValue || "(none)"}`
+      );
+    } catch {}
+  });
 
   // ✅ Prevent "409 terminated by other getUpdates request" staying broken
   bot.on("polling_error", async (err) => {
