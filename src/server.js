@@ -1500,6 +1500,7 @@ You’ll get smart buttons for every supported tool.
   const pendingPasswordActions = new Map(); // chatId -> { conversion, fileId, ext, target, mode }
   const pendingCommandFileActions = new Map(); // chatId -> { target }
   const pendingTranslationActions = new Map(); // chatId -> { fileId, ext, mode }
+  const pendingSplitActions = new Map(); // chatId -> { fileId, ext, mode, pagesInput, stage }
 
   // ✅ Step-by-step merge mode
   const mergeSessions = new Map(); // chatId -> { fileIds: [], startedAt: Date.now() }
@@ -1536,6 +1537,45 @@ You’ll get smart buttons for every supported tool.
     return { inline_keyboard: rows };
   }
 
+  function buildSplitModeKeyboard() {
+    return {
+      inline_keyboard: [[
+        { text: "Simple split", callback_data: "splitmode:simple" },
+        { text: "Grouped split", callback_data: "splitmode:grouped" }
+      ]]
+    };
+  }
+
+  function buildSplitConfirmKeyboard() {
+    return {
+      inline_keyboard: [[
+        { text: "✅ Yes", callback_data: "splitconfirm:yes" },
+        { text: "❌ No", callback_data: "splitconfirm:no" }
+      ]]
+    };
+  }
+
+  async function startSplitFlow(chatId, fileId, ext) {
+    pendingSplitActions.set(chatId, { fileId, ext, mode: null, pagesInput: null, stage: "mode" });
+    await bot.sendMessage(
+      chatId,
+      "✂️ Split setup started.\nChoose split mode:\n• Simple split: split once from a page number\n• Grouped split: use ranges like 1-10,35-40",
+      { reply_markup: buildSplitModeKeyboard() }
+    );
+  }
+
+  function normalizeSplitPagesInput(splitAction, text) {
+    if (splitAction.mode === "simple") {
+      const num = Number(text);
+      if (!Number.isInteger(num) || num < 2) return null;
+      return `from:${num}`;
+    }
+
+    const raw = text.replace(/\s+/g, "");
+    const valid = /^(\d+(?:-\d+)?)(,(\d+(?:-\d+)?))*$/.test(raw);
+    return valid ? raw : null;
+  }
+
   const helpText =
 `🧠 HOW TO USE
 
@@ -1548,7 +1588,7 @@ Convert:
 • to pdf / to docx / to xlsx / to txt / to csv / to json
 PDF tools:
 • to compress
-• to ocr
+• to ocr (requires ocrmypdf or tesseract installed on server)
 • to split pages=1-3,5 OR pages=from:4 OR pages=every:2
 • to translate lang=es
 • to protect (then send password when asked)
@@ -1589,9 +1629,15 @@ Languages for translate: ${Object.entries(TRANSLATION_LANGUAGES).map(([k, v]) =>
   bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, startText));
   bot.onText(/\/help/, (msg) => bot.sendMessage(msg.chat.id, helpText));
   bot.onText(/\/status/, (msg) => bot.sendMessage(msg.chat.id, "✅ Bot is running. Send a file."));
-  bot.onText(/\/split/, (msg) => bot.sendMessage(msg.chat.id, "✂️ Split: Send PDF and use caption examples: pages=1-3,5 OR pages=from:4 OR pages=every:2"));
+  bot.onText(/\/split/, (msg) => {
+    pendingCommandFileActions.set(msg.chat.id, { target: "split" });
+    bot.sendMessage(
+      msg.chat.id,
+      "✂️ Split mode: please send a PDF first. Then I'll ask simple/grouped split and ask for confirmation."
+    );
+  });
   bot.onText(/\/compress/, (msg) => bot.sendMessage(msg.chat.id, "🗜️ Compress: Send a PDF and tap “Compressed PDF” or caption: to compress"));
-  bot.onText(/\/ocr/, (msg) => bot.sendMessage(msg.chat.id, "🔎 OCR: Send a scanned PDF and tap “PDF → OCR (Searchable)”."));
+  bot.onText(/\/ocr/, (msg) => bot.sendMessage(msg.chat.id, "🔎 OCR: Send a scanned PDF and tap “PDF → OCR (Searchable)”. OCR requires ocrmypdf or tesseract installed on server."));
   bot.onText(/\/translate/, (msg) => {
     pendingCommandFileActions.set(msg.chat.id, { target: "translate" });
     bot.sendMessage(msg.chat.id, "🌍 Translate mode: send a PDF first. Then send a language code like en, es, fr, de, ar, hi.");
@@ -1620,6 +1666,7 @@ Languages for translate: ${Object.entries(TRANSLATION_LANGUAGES).map(([k, v]) =>
   bot.onText(/\/cancel/, (msg) => {
     mergeSessions.delete(msg.chat.id);
     scanToPdfSessions.delete(msg.chat.id);
+    pendingSplitActions.delete(msg.chat.id);
     bot.sendMessage(msg.chat.id, "❌ Active batch mode cancelled.");
   });
 
@@ -1834,6 +1881,11 @@ Send more or type /done`);
 
       pendingCommandFileActions.delete(chatId);
 
+      if (pendingFileAction.target === "split") {
+        await startSplitFlow(chatId, doc.file_id, ext);
+        return;
+      }
+
       if (conversion.needsPassword) {
         pendingPasswordActions.set(chatId, {
           conversion,
@@ -1919,6 +1971,11 @@ Send more or type /done`);
       return bot.sendMessage(chatId, `❌ Target "${target}" not supported. Use buttons.`);
     }
 
+    if (target === "split" && !pages) {
+      await startSplitFlow(chatId, doc.file_id, ext);
+      return;
+    }
+
     if (conversion.needsPassword && !password) {
       pendingPasswordActions.set(chatId, {
         conversion,
@@ -1953,6 +2010,70 @@ Send more or type /done`);
 
   bot.on("callback_query", async (query) => {
     const data = query.data || "";
+    if (data.startsWith("splitmode:") || data.startsWith("splitconfirm:")) {
+      const splitAction = pendingSplitActions.get(query.message?.chat?.id);
+      const chatId = query.message?.chat?.id;
+
+      if (!chatId || !splitAction) {
+        await bot.answerCallbackQuery(query.id, { text: "Split session expired. Use /split again." });
+        return;
+      }
+
+      if (data.startsWith("splitmode:")) {
+        const mode = data.split(":")[1];
+        if (!mode || !["simple", "grouped"].includes(mode)) {
+          await bot.answerCallbackQuery(query.id, { text: "Invalid mode." });
+          return;
+        }
+
+        splitAction.mode = mode;
+        splitAction.stage = "pages";
+        pendingSplitActions.set(chatId, splitAction);
+        await bot.answerCallbackQuery(query.id, { text: `${mode} mode selected` });
+
+        if (mode === "simple") {
+          await bot.sendMessage(chatId, "Send the page number from which to split (example: 4). This creates 1-3 and 4-end.");
+        } else {
+          await bot.sendMessage(chatId, "Send grouped ranges like: 1-10,35-40");
+        }
+        return;
+      }
+
+      if (data.startsWith("splitconfirm:")) {
+        const answer = data.split(":")[1];
+        if (!splitAction.pagesInput) {
+          await bot.answerCallbackQuery(query.id, { text: "Missing split pages. Send pages again." });
+          return;
+        }
+
+        if (answer === "no") {
+          splitAction.stage = "pages";
+          pendingSplitActions.set(chatId, splitAction);
+          await bot.answerCallbackQuery(query.id, { text: "Okay, send pages again." });
+          await bot.sendMessage(chatId, splitAction.mode === "simple"
+            ? "Please send a new page number (example: 4)."
+            : "Please send new grouped ranges (example: 1-10,35-40)."
+          );
+          return;
+        }
+
+        if (answer === "yes") {
+          pendingSplitActions.delete(chatId);
+          await bot.answerCallbackQuery(query.id, { text: "Starting split..." });
+
+          await performConversion({
+            chatId,
+            conversion: telegramConversions[".pdf"].split,
+            fileId: splitAction.fileId,
+            ext: splitAction.ext,
+            resolvedTarget: "split",
+            context: { pages: splitAction.pagesInput }
+          });
+          return;
+        }
+      }
+    }
+
     if (!data.startsWith("conv:")) return;
 
     const [, token, target] = data.split(":");
@@ -1978,6 +2099,12 @@ Send more or type /done`);
     const password = parsePassword(caption);
     const pages = parsePages(caption);
     const language = parseLanguage(caption);
+
+    if (target === "split" && !pages) {
+      await bot.answerCallbackQuery(query.id, { text: "Split setup started" });
+      await startSplitFlow(pending.chatId, pending.fileId, pending.ext);
+      return;
+    }
 
     if (conversion.needsPassword && !password) {
       pendingPasswordActions.set(pending.chatId, {
@@ -2040,6 +2167,28 @@ Send more or type /done`);
         resolvedTarget: pendingTranslation.target,
         context: { language }
       });
+      return;
+    }
+
+    const pendingSplit = pendingSplitActions.get(chatId);
+    if (pendingSplit && pendingSplit.stage === "pages") {
+      const normalized = normalizeSplitPagesInput(pendingSplit, text);
+      if (!normalized) {
+        await bot.sendMessage(chatId, pendingSplit.mode === "simple"
+          ? "❌ Invalid number. Send a page number greater than 1 (example: 4)."
+          : "❌ Invalid format. Use grouped ranges like 1-10,35-40"
+        );
+        return;
+      }
+
+      pendingSplit.pagesInput = normalized;
+      pendingSplit.stage = "confirm";
+      pendingSplitActions.set(chatId, pendingSplit);
+      await bot.sendMessage(
+        chatId,
+        `Confirm split with: ${normalized} ?`,
+        { reply_markup: buildSplitConfirmKeyboard() }
+      );
       return;
     }
 
