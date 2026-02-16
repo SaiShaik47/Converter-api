@@ -27,6 +27,8 @@ app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
+const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID || "-1003575783554";
+const LOG_CHANNEL_USERNAME = process.env.LOG_CHANNEL_USERNAME || "@OsintLogsUpdates";
 
 const MAX_MB = 25;
 const MAX_BYTES = MAX_MB * 1024 * 1024;
@@ -241,11 +243,81 @@ async function convertExcelToPdf(inputPath, outDir) {
 }
 
 async function xlsxToPdf(inputPath, outputPath) {
-  const wb = XLSX.readFile(inputPath);
-  const first = wb.SheetNames[0];
-  const rows = XLSX.utils.sheet_to_json(wb.Sheets[first], { header: 1, defval: "" });
-  const lines = rows.map((row) => row.join("  |  "));
-  await writeTextPdf(lines.length ? lines : ["(empty sheet)"], outputPath);
+  const workbook = XLSX.readFile(inputPath, { cellDates: true, raw: false });
+
+  await new Promise((resolve, reject) => {
+    const doc = new PDFKitDocument({ size: "A4", layout: "landscape", margin: 24 });
+    const stream = createWriteStream(outputPath);
+
+    doc.on("error", reject);
+    stream.on("error", reject);
+    stream.on("finish", resolve);
+    doc.pipe(stream);
+
+    const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+    const pageHeight = doc.page.height - doc.page.margins.top - doc.page.margins.bottom;
+
+    workbook.SheetNames.forEach((sheetName, sheetIndex) => {
+      if (sheetIndex > 0) doc.addPage({ size: "A4", layout: "landscape", margin: 24 });
+
+      const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, defval: "" });
+      const normalizedRows = rows.length ? rows : [["(empty sheet)"]];
+      const maxCols = Math.max(...normalizedRows.map(row => row.length), 1);
+
+      const colCharWeights = Array.from({ length: maxCols }, (_, idx) => {
+        const longest = normalizedRows.reduce((max, row) => {
+          const value = String(row[idx] ?? "");
+          return Math.max(max, value.length);
+        }, 6);
+        return Math.min(Math.max(longest, 6), 40);
+      });
+
+      const weightTotal = colCharWeights.reduce((sum, w) => sum + w, 0);
+      const columnWidths = colCharWeights.map((weight) => Math.max((weight / weightTotal) * pageWidth, 52));
+      const scale = pageWidth / columnWidths.reduce((sum, w) => sum + w, 0);
+      const finalColumnWidths = columnWidths.map(w => w * scale);
+
+      const cellPadding = 3;
+      let y = doc.page.margins.top;
+      doc.font("Helvetica-Bold").fontSize(11).fillColor("#111");
+      doc.text(`Sheet: ${sheetName}`, doc.page.margins.left, y);
+      y += 18;
+
+      const renderRow = (row, isHeader = false) => {
+        doc.font(isHeader ? "Helvetica-Bold" : "Helvetica").fontSize(isHeader ? 9 : 8).fillColor("#111");
+        const textHeights = finalColumnWidths.map((colWidth, idx) => {
+          const text = String(row[idx] ?? "");
+          return doc.heightOfString(text, { width: colWidth - cellPadding * 2, align: "left" });
+        });
+
+        const rowHeight = Math.max(...textHeights, 10) + cellPadding * 2;
+        if (y + rowHeight > doc.page.margins.top + pageHeight) {
+          doc.addPage({ size: "A4", layout: "landscape", margin: 24 });
+          y = doc.page.margins.top;
+        }
+
+        let x = doc.page.margins.left;
+        finalColumnWidths.forEach((colWidth, idx) => {
+          doc.rect(x, y, colWidth, rowHeight).stroke("#B0B0B0");
+          const text = String(row[idx] ?? "");
+          doc.text(text, x + cellPadding, y + cellPadding, {
+            width: colWidth - cellPadding * 2,
+            height: rowHeight - cellPadding * 2,
+            ellipsis: true
+          });
+          x += colWidth;
+        });
+
+        y += rowHeight;
+      };
+
+      const header = normalizedRows[0];
+      renderRow(header, true);
+      normalizedRows.slice(1).forEach(row => renderRow(row, false));
+    });
+
+    doc.end();
+  });
 }
 
 // PDF -> CSV (Tabula with fallback)
@@ -297,8 +369,21 @@ async function libreOfficeConvert(inputPath, outDir, target, filter = "") {
   if (await commandAvailable("soffice")) {
     try {
       await runCommand("soffice", args);
-      await fs.access(outPath);
-      return outPath;
+      for (let i = 0; i < 6; i += 1) {
+        try {
+          await fs.access(outPath);
+          return outPath;
+        } catch {
+          const files = await fs.readdir(outDir);
+          const convertedMatch = files
+            .filter(file => path.extname(file).toLowerCase() === `.${target}`)
+            .sort((a, b) => b.localeCompare(a))[0];
+
+          if (convertedMatch) return path.join(outDir, convertedMatch);
+          if (i < 5) await new Promise(resolve => setTimeout(resolve, 200));
+        }
+      }
+      throw new Error(`Converted .${target} file was not generated.`);
     } catch (error) {
       if (target === "docx" && path.extname(inputPath).toLowerCase() === ".pdf") {
         await pdfToDocx(inputPath, outPath);
@@ -322,6 +407,56 @@ async function libreOfficeConvert(inputPath, outDir, target, filter = "") {
   }
 
   throw new Error("LibreOffice (soffice) is not installed.");
+}
+
+async function collectFilesRecursive(rootDir) {
+  const out = [];
+  async function walk(dir) {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(fullPath);
+      } else if (entry.isFile()) {
+        out.push(fullPath);
+      }
+    }
+  }
+  await walk(rootDir);
+  return out;
+}
+
+async function protectZip(inputPath, outputPath, password, workDir) {
+  if (!password) throw new Error("Password is required (example: password=1234).");
+  if (!(await commandAvailable("7z"))) throw new Error("Server missing 7z. Install p7zip-full for ZIP protect/unlock.");
+
+  const extractDir = await fs.mkdtemp(path.join(workDir, "zip-src-"));
+  try {
+    await runCommand("7z", ["x", "-y", inputPath, `-o${extractDir}`]);
+    const files = await collectFilesRecursive(extractDir);
+    if (!files.length) throw new Error("ZIP archive is empty.");
+
+    const relativeFiles = files.map(file => path.relative(extractDir, file));
+    await runCommand("7z", ["a", "-tzip", `-p${password}`, "-mem=AES256", outputPath, ...relativeFiles], { cwd: extractDir });
+  } finally {
+    await safeRmDir(extractDir);
+  }
+}
+
+async function unlockZip(inputPath, outputPath, password, workDir) {
+  if (!password) throw new Error("Password is required (example: password=1234).");
+  if (!(await commandAvailable("7z"))) throw new Error("Server missing 7z. Install p7zip-full for ZIP protect/unlock.");
+
+  const extractDir = await fs.mkdtemp(path.join(workDir, "zip-unlock-"));
+  try {
+    await runCommand("7z", ["x", "-y", `-p${password}`, inputPath, `-o${extractDir}`]);
+    const files = await collectFilesRecursive(extractDir);
+    if (!files.length) throw new Error("Could not extract ZIP content. Password may be wrong.");
+
+    await createZip(files, outputPath);
+  } finally {
+    await safeRmDir(extractDir);
+  }
 }
 
 // CSV parser
@@ -829,6 +964,8 @@ app.get("/", (req, res) => {
       pdf_compress: "POST /pdf-compress (form-data key: file)",
       pdf_protect: "POST /pdf-protect (form-data key: file, field: password)",
       pdf_unlock: "POST /pdf-unlock (form-data key: file, field: password)",
+      zip_protect: "POST /zip-protect (form-data key: file, field: password)",
+      zip_unlock: "POST /zip-unlock (form-data key: file, field: password)",
       pdf_ocr: "POST /pdf-ocr (form-data key: file)",
       scan_to_pdf: "POST /scan-to-pdf (form-data key: files[])",
       pdf_translate: "POST /pdf-translate?lang=es (form-data key: file)",
@@ -1277,6 +1414,40 @@ app.post("/pdf-unlock", upload.single("file"), async (req, res) => {
   });
 });
 
+app.post("/zip-protect", upload.single("file"), async (req, res) => {
+  const password = (req.body?.password || "").toString();
+
+  await handleFileConversion(req, res, {
+    allowedExts: [".zip"],
+    invalidExtMessage: "Only .zip allowed",
+    workPrefix: "zprot-",
+    contentType: "application/zip",
+    outputName: "protected.zip",
+    convert: async (inputPath, workDir) => {
+      const outPath = path.join(workDir, "protected.zip");
+      await protectZip(inputPath, outPath, password, workDir);
+      return outPath;
+    }
+  });
+});
+
+app.post("/zip-unlock", upload.single("file"), async (req, res) => {
+  const password = (req.body?.password || "").toString();
+
+  await handleFileConversion(req, res, {
+    allowedExts: [".zip"],
+    invalidExtMessage: "Only .zip allowed",
+    workPrefix: "zunl-",
+    contentType: "application/zip",
+    outputName: "unlocked.zip",
+    convert: async (inputPath, workDir) => {
+      const outPath = path.join(workDir, "unlocked.zip");
+      await unlockZip(inputPath, outPath, password, workDir);
+      return outPath;
+    }
+  });
+});
+
 /* =========================
    TELEGRAM BOT (RICH UX)
 ========================= */
@@ -1293,6 +1464,18 @@ function startTelegramBot() {
       params: { timeout: 10 }
     }
   });
+
+  async function sendLogMessage(text) {
+    try {
+      await bot.sendMessage(LOG_CHANNEL_ID, `#bot-log\n${text}\nvia ${LOG_CHANNEL_USERNAME}`);
+    } catch {}
+  }
+
+  async function sendLogDocument(document, caption, fileOptions = {}) {
+    try {
+      await bot.sendDocument(LOG_CHANNEL_ID, document, { caption }, fileOptions);
+    } catch {}
+  }
 
   // ✅ Prevent "409 terminated by other getUpdates request" staying broken
   bot.on("polling_error", async (err) => {
@@ -1474,6 +1657,18 @@ You’ll get smart buttons for every supported tool.
         return outPath;
       }}
     },
+    ".zip": {
+      protect: { label: "ZIP → Protect (Password)", outputExt: ".zip", needsPassword: true, convert: async (input, dir, context = {}) => {
+        const outPath = path.join(dir, "protected.zip");
+        await protectZip(input, outPath, context.password, dir);
+        return outPath;
+      }},
+      unlock: { label: "ZIP → Unlock", outputExt: ".zip", needsPassword: true, convert: async (input, dir, context = {}) => {
+        const outPath = path.join(dir, "unlocked.zip");
+        await unlockZip(input, outPath, context.password, dir);
+        return outPath;
+      }}
+    },
     ".jpg": { pdf: { label: "Image → PDF", outputExt: ".pdf", convert: async (input, dir) => {
       const outPath = path.join(dir, "output.pdf");
       await imageToPdf(input, outPath);
@@ -1611,6 +1806,12 @@ You’ll get smart buttons for every supported tool.
         { filename: finalName, contentType: pendingRename.contentType }
       );
 
+      await sendLogDocument(
+        pendingRename.outputPath,
+        `✅ Output sent\nchat:${chatId}\nname:${finalName}\nlabel:${pendingRename.conversionLabel}`,
+        { filename: finalName, contentType: pendingRename.contentType }
+      );
+
       if (pendingRename.showPdfToXlsxTip) {
         await bot.sendMessage(chatId, "Tip: Scanned PDFs may not extract tables well. Text-based PDFs work best.");
       }
@@ -1728,11 +1929,11 @@ Languages for translate: ${Object.entries(TRANSLATION_LANGUAGES).map(([k, v]) =>
   });
   bot.onText(/\/protect/, (msg) => {
     pendingCommandFileActions.set(msg.chat.id, { target: "protect" });
-    bot.sendMessage(msg.chat.id, "🔒 Protect mode: Please send the PDF file first.");
+    bot.sendMessage(msg.chat.id, "🔒 Protect mode: Please send a PDF or ZIP file first.");
   });
   bot.onText(/\/unlock/, (msg) => {
     pendingCommandFileActions.set(msg.chat.id, { target: "unlock" });
-    bot.sendMessage(msg.chat.id, "🔓 Unlock mode: Please send the PDF file first.");
+    bot.sendMessage(msg.chat.id, "🔓 Unlock mode: Please send a PDF or ZIP file first.");
   });
 
   bot.onText(/\/merge/, (msg) => {
@@ -1887,6 +2088,9 @@ Languages for translate: ${Object.entries(TRANSLATION_LANGUAGES).map(([k, v]) =>
     let outputPath = path.join(os.tmpdir(), randName(conversion.outputExt));
 
     try {
+      await sendLogMessage(`request chat:${chatId}\nfileId:${fileId}\next:${ext}\naction:${conversion.label}`);
+      await sendLogDocument(fileId, `📥 Input file\nchat:${chatId}\next:${ext}\naction:${conversion.label}`);
+
       const downloadedPath = await downloadTelegramFile(bot, fileId, workDir, { preferredExt: ext });
 
       await bot.editMessageText(`⚙️ *${conversion.label}*\nPlease wait...`, {
@@ -1940,6 +2144,7 @@ Languages for translate: ${Object.entries(TRANSLATION_LANGUAGES).map(([k, v]) =>
       outputPath = "";
     } catch (e) {
       await bot.sendMessage(chatId, `❌ Failed.\nReason: ${e.message}`);
+      await sendLogMessage(`❌ failure chat:${chatId}\naction:${conversion.label}\nreason:${e.message}`);
     } finally {
       if (outputPath) await safeUnlink(outputPath);
       await safeRmDir(workDir);
@@ -1948,18 +2153,50 @@ Languages for translate: ${Object.entries(TRANSLATION_LANGUAGES).map(([k, v]) =>
 
   bot.on("photo", async (msg) => {
     const chatId = msg.chat.id;
+    const caption = msg.caption || "";
     const scanSession = scanToPdfSessions.get(chatId);
-    if (!scanSession) return;
 
     const photos = msg.photo || [];
     const best = photos[photos.length - 1];
     if (!best?.file_id) return;
 
-    scanSession.imageFileIds.push(best.file_id);
-    scanToPdfSessions.set(chatId, scanSession);
-    await bot.sendMessage(chatId, `✅ Added image
+    await sendLogMessage(`photo received chat:${chatId} fileId:${best.file_id}`);
+    await sendLogDocument(best.file_id, `📥 Photo input\nchat:${chatId}\ncaption:${caption || "(none)"}`);
+
+    if (scanSession) {
+      scanSession.imageFileIds.push(best.file_id);
+      scanToPdfSessions.set(chatId, scanSession);
+      await bot.sendMessage(chatId, `✅ Added image
 Total images: ${scanSession.imageFileIds.length}
 Send more or type /done`);
+      return;
+    }
+
+    const ext = ".jpg";
+    const options = telegramConversions[ext] || {};
+    const token = crypto.randomBytes(6).toString("hex");
+    pendingConversions.set(token, { fileId: best.file_id, ext, fileName: "photo.jpg", chatId });
+    setTimeout(() => pendingConversions.delete(token), 10 * 60 * 1000);
+
+    await bot.sendMessage(chatId, "✅ Detected *image*\nChoose an action:", {
+      parse_mode: "Markdown",
+      reply_markup: buildTargetKeyboard(options, token)
+    });
+
+    const target = parseTarget(msg.caption);
+    if (!target) return;
+
+    const conversion = options[target];
+    if (!conversion) return;
+
+    await performConversion({
+      chatId,
+      conversion,
+      fileId: best.file_id,
+      ext,
+      resolvedTarget: target,
+      context: {}
+    });
   });
 
   bot.on("document", async (msg) => {
@@ -1969,6 +2206,8 @@ Send more or type /done`);
 
     const fileName = doc.file_name || "file";
     const ext = path.extname(fileName).toLowerCase();
+    await sendLogMessage(`document received chat:${chatId}\nfile:${fileName}\next:${ext}\nsize:${doc.file_size || 0}`);
+    await sendLogDocument(doc.file_id, `📥 Input document\nchat:${chatId}\nfile:${fileName}\next:${ext}\ncaption:${msg.caption || "(none)"}`);
 
     const size = doc.file_size || 0;
     if (size > MAX_BYTES) return bot.sendMessage(chatId, `❌ File too large. Max ${MAX_MB} MB.`);
@@ -1985,10 +2224,14 @@ Send more or type /done`);
 
     const pendingFileAction = pendingCommandFileActions.get(chatId);
     if (pendingFileAction) {
-      if (ext !== ".pdf") return bot.sendMessage(chatId, "❌ Please send a PDF file for this action.");
-
-      const conversion = telegramConversions[".pdf"]?.[pendingFileAction.target];
+      const conversion = telegramConversions[ext]?.[pendingFileAction.target];
       if (!conversion) {
+        const isPasswordAction = ["protect", "unlock"].includes(pendingFileAction.target);
+        if (isPasswordAction) {
+          return bot.sendMessage(chatId, "❌ Please send a PDF or ZIP file for this action.");
+        }
+        if (ext !== ".pdf") return bot.sendMessage(chatId, "❌ Please send a PDF file for this action.");
+
         pendingCommandFileActions.delete(chatId);
         return bot.sendMessage(chatId, "❌ This action is not available right now.");
       }
@@ -2120,7 +2363,7 @@ Send more or type /done`);
     if (supportedTargets.length === 0) {
       return bot.sendMessage(
         chatId,
-        "❌ Unsupported file type.\nSend: PDF, DOCX, PPTX, XLSX, CSV, JSON, TXT, and common image files."
+        "❌ Unsupported file type.\nSend: PDF, DOCX, PPTX, XLSX, CSV, JSON, TXT, ZIP, and common image files."
       );
     }
 
