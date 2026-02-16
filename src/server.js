@@ -1501,6 +1501,7 @@ You’ll get smart buttons for every supported tool.
   const pendingCommandFileActions = new Map(); // chatId -> { target }
   const pendingTranslationActions = new Map(); // chatId -> { fileId, ext, mode }
   const pendingSplitActions = new Map(); // chatId -> { fileId, ext, mode, pagesInput, stage }
+  const pendingRenameActions = new Map(); // chatId -> { outputPath, conversionLabel, outputExt, requestedBaseName, stage, showPdfToXlsxTip }
 
   // ✅ Step-by-step merge mode
   const mergeSessions = new Map(); // chatId -> { fileIds: [], startedAt: Date.now() }
@@ -1555,6 +1556,54 @@ You’ll get smart buttons for every supported tool.
     };
   }
 
+  function buildRenameConfirmKeyboard() {
+    return {
+      inline_keyboard: [[
+        { text: "✅ Confirm", callback_data: "renameconfirm:yes" },
+        { text: "✏️ Change name", callback_data: "renameconfirm:no" }
+      ]]
+    };
+  }
+
+  function sanitizeOutputBaseName(input) {
+    if (!input) return "";
+    return input
+      .replace(/\.[a-z0-9]+$/i, "")
+      .replace(/[\\/:*?"<>|]/g, "-")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^[-.]+|[-.]+$/g, "")
+      .slice(0, 80);
+  }
+
+  async function flushRenameOutput(chatId, customBaseName = "") {
+    const pendingRename = pendingRenameActions.get(chatId);
+    if (!pendingRename) return false;
+
+    const baseName = sanitizeOutputBaseName(customBaseName) || `converted-${Date.now()}`;
+    const finalName = `${baseName}${pendingRename.outputExt}`;
+
+    pendingRenameActions.delete(chatId);
+    if (pendingRename.timer) clearTimeout(pendingRename.timer);
+
+    try {
+      await bot.sendDocument(
+        chatId,
+        pendingRename.outputPath,
+        { caption: `✅ ${pendingRename.conversionLabel}` },
+        { filename: finalName, contentType: pendingRename.contentType }
+      );
+
+      if (pendingRename.showPdfToXlsxTip) {
+        await bot.sendMessage(chatId, "Tip: Scanned PDFs may not extract tables well. Text-based PDFs work best.");
+      }
+    } finally {
+      await safeUnlink(pendingRename.outputPath);
+    }
+
+    return true;
+  }
+
   async function startSplitFlow(chatId, fileId, ext) {
     pendingSplitActions.set(chatId, { fileId, ext, mode: null, pagesInput: null, stage: "mode" });
     await bot.sendMessage(
@@ -1593,6 +1642,10 @@ PDF tools:
 • to translate lang=es
 • to protect (then send password when asked)
 • to unlock (then send password when asked)
+
+After any conversion:
+• Bot asks for output filename
+• Bot asks confirmation before sending renamed file
 
 3) Merge PDFs (2 ways)
 ✅ A) Media group:
@@ -1667,6 +1720,10 @@ Languages for translate: ${Object.entries(TRANSLATION_LANGUAGES).map(([k, v]) =>
     mergeSessions.delete(msg.chat.id);
     scanToPdfSessions.delete(msg.chat.id);
     pendingSplitActions.delete(msg.chat.id);
+    const pendingRename = pendingRenameActions.get(msg.chat.id);
+    if (pendingRename?.timer) clearTimeout(pendingRename.timer);
+    if (pendingRename?.outputPath) safeUnlink(pendingRename.outputPath);
+    pendingRenameActions.delete(msg.chat.id);
     bot.sendMessage(msg.chat.id, "❌ Active batch mode cancelled.");
   });
 
@@ -1799,7 +1856,7 @@ Languages for translate: ${Object.entries(TRANSLATION_LANGUAGES).map(([k, v]) =>
     });
 
     const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "tg-"));
-    const outputPath = path.join(os.tmpdir(), randName(conversion.outputExt));
+    let outputPath = path.join(os.tmpdir(), randName(conversion.outputExt));
 
     try {
       const downloadedPath = await downloadTelegramFile(bot, fileId, workDir, { preferredExt: ext });
@@ -1819,15 +1876,44 @@ Languages for translate: ${Object.entries(TRANSLATION_LANGUAGES).map(([k, v]) =>
         parse_mode: "Markdown"
       });
 
-      await bot.sendDocument(chatId, outputPath, { caption: `✅ ${conversion.label}` });
+      const defaultBaseName = sanitizeOutputBaseName(
+        path.basename(convertedPath, path.extname(convertedPath)) || `${resolvedTarget || "converted"}-file`
+      ) || `${resolvedTarget || "converted"}-file`;
 
-      if (resolvedTarget === "xlsx" && ext === ".pdf") {
-        await bot.sendMessage(chatId, "Tip: Scanned PDFs may not extract tables well. Text-based PDFs work best.");
-      }
+      const renamePrompt = await bot.sendMessage(
+        chatId,
+        `✅ *${conversion.label}* done.\nSend the output filename (without extension) to rename this file to *.${conversion.outputExt.replace(".", "")}*.`,
+        { parse_mode: "Markdown" }
+      );
+
+      const timer = setTimeout(async () => {
+        const autoSent = await flushRenameOutput(chatId, defaultBaseName);
+        if (autoSent) {
+          await bot.sendMessage(chatId, `⏱️ No name received in time. Sent with default name: ${defaultBaseName}${conversion.outputExt}`);
+        }
+      }, 90 * 1000);
+
+      const existingRename = pendingRenameActions.get(chatId);
+      if (existingRename?.timer) clearTimeout(existingRename.timer);
+      if (existingRename?.outputPath) await safeUnlink(existingRename.outputPath);
+
+      pendingRenameActions.set(chatId, {
+        outputPath,
+        conversionLabel: conversion.label,
+        outputExt: conversion.outputExt,
+        requestedBaseName: defaultBaseName,
+        stage: "awaiting_name",
+        messageId: renamePrompt.message_id,
+        timer,
+        contentType: conversion.contentType,
+        showPdfToXlsxTip: resolvedTarget === "xlsx" && ext === ".pdf"
+      });
+
+      outputPath = "";
     } catch (e) {
       await bot.sendMessage(chatId, `❌ Failed.\nReason: ${e.message}`);
     } finally {
-      await safeUnlink(outputPath);
+      if (outputPath) await safeUnlink(outputPath);
       await safeRmDir(workDir);
     }
   }
@@ -2010,6 +2096,30 @@ Send more or type /done`);
 
   bot.on("callback_query", async (query) => {
     const data = query.data || "";
+    if (data.startsWith("renameconfirm:")) {
+      const chatId = query.message?.chat?.id;
+      const pendingRename = chatId ? pendingRenameActions.get(chatId) : null;
+      if (!chatId || !pendingRename) {
+        await bot.answerCallbackQuery(query.id, { text: "Rename session expired." });
+        return;
+      }
+
+      const answer = data.split(":")[1];
+      if (answer === "yes") {
+        await bot.answerCallbackQuery(query.id, { text: "Sending file..." });
+        await flushRenameOutput(chatId, pendingRename.requestedBaseName);
+        return;
+      }
+
+      if (answer === "no") {
+        pendingRename.stage = "awaiting_name";
+        pendingRenameActions.set(chatId, pendingRename);
+        await bot.answerCallbackQuery(query.id, { text: "Okay, send another name." });
+        await bot.sendMessage(chatId, `✏️ Send a new filename (without extension). Extension will stay ${pendingRename.outputExt}`);
+        return;
+      }
+    }
+
     if (data.startsWith("splitmode:") || data.startsWith("splitconfirm:")) {
       const splitAction = pendingSplitActions.get(query.message?.chat?.id);
       const chatId = query.message?.chat?.id;
@@ -2149,6 +2259,26 @@ Send more or type /done`);
     const chatId = msg.chat.id;
     const text = (msg.text || "").trim();
     if (!text || text.startsWith("/")) return;
+
+    const pendingRename = pendingRenameActions.get(chatId);
+    if (pendingRename) {
+      const cleaned = sanitizeOutputBaseName(text);
+      if (!cleaned) {
+        await bot.sendMessage(chatId, "❌ Invalid filename. Use letters/numbers and avoid only symbols.");
+        return;
+      }
+
+      pendingRename.requestedBaseName = cleaned;
+      pendingRename.stage = "awaiting_confirm";
+      pendingRenameActions.set(chatId, pendingRename);
+
+      await bot.sendMessage(
+        chatId,
+        `Confirm new filename: *${cleaned}${pendingRename.outputExt}* ?`,
+        { parse_mode: "Markdown", reply_markup: buildRenameConfirmKeyboard() }
+      );
+      return;
+    }
 
     const pendingTranslation = pendingTranslationActions.get(chatId);
     if (pendingTranslation) {
