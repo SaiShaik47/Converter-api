@@ -1042,6 +1042,7 @@ You’ll get smart buttons for every supported tool.
 • Send invoice.pdf → tap Split / Compress / Protect / Unlock
 • Send report.pdf with caption: to docx
 • Send 2+ PDFs together with caption: merge
+• Tap Protect/Unlock → send password when asked
 
 📦 Limits:
 • Max file size: ${MAX_MB} MB
@@ -1203,6 +1204,8 @@ You’ll get smart buttons for every supported tool.
 
   const pendingConversions = new Map();
   const pendingMediaMerges = new Map();
+  const pendingPasswordActions = new Map(); // chatId -> { conversion, fileId, ext, target, mode }
+  const pendingCommandFileActions = new Map(); // chatId -> { target }
 
   // ✅ Step-by-step merge mode
   const mergeSessions = new Map(); // chatId -> { fileIds: [], startedAt: Date.now() }
@@ -1251,8 +1254,8 @@ Convert:
 PDF tools:
 • to compress
 • to split pages=1-3,5
-• to protect password=1234
-• to unlock pass=1234
+• to protect (then send password when asked)
+• to unlock (then send password when asked)
 
 3) Merge PDFs (2 ways)
 ✅ A) Media group:
@@ -1285,8 +1288,14 @@ Limit: ${MAX_MB} MB`;
   bot.onText(/\/status/, (msg) => bot.sendMessage(msg.chat.id, "✅ Bot is running. Send a file."));
   bot.onText(/\/split/, (msg) => bot.sendMessage(msg.chat.id, "✂️ Split: Send a PDF and tap “Split (ZIP)” or caption: to split pages=1-3,5"));
   bot.onText(/\/compress/, (msg) => bot.sendMessage(msg.chat.id, "🗜️ Compress: Send a PDF and tap “Compressed PDF” or caption: to compress"));
-  bot.onText(/\/protect/, (msg) => bot.sendMessage(msg.chat.id, "🔒 Protect: Send PDF with caption: to protect password=1234 (or tap Protect)"));
-  bot.onText(/\/unlock/, (msg) => bot.sendMessage(msg.chat.id, "🔓 Unlock: Send PDF with caption: to unlock pass=1234 (or tap Unlock)"));
+  bot.onText(/\/protect/, (msg) => {
+    pendingCommandFileActions.set(msg.chat.id, { target: "protect" });
+    bot.sendMessage(msg.chat.id, "🔒 Protect mode: Please send the PDF file first.");
+  });
+  bot.onText(/\/unlock/, (msg) => {
+    pendingCommandFileActions.set(msg.chat.id, { target: "unlock" });
+    bot.sendMessage(msg.chat.id, "🔓 Unlock mode: Please send the PDF file first.");
+  });
 
   bot.onText(/\/merge/, (msg) => {
     mergeSessions.set(msg.chat.id, { fileIds: [], startedAt: Date.now() });
@@ -1441,6 +1450,27 @@ Limit: ${MAX_MB} MB`;
     const size = doc.file_size || 0;
     if (size > MAX_BYTES) return bot.sendMessage(chatId, `❌ File too large. Max ${MAX_MB} MB.`);
 
+    const pendingFileAction = pendingCommandFileActions.get(chatId);
+    if (pendingFileAction) {
+      if (ext !== ".pdf") return bot.sendMessage(chatId, "❌ Please send a PDF file for this action.");
+
+      const conversion = telegramConversions[".pdf"]?.[pendingFileAction.target];
+      if (!conversion) {
+        pendingCommandFileActions.delete(chatId);
+        return bot.sendMessage(chatId, "❌ This action is not available right now.");
+      }
+
+      pendingCommandFileActions.delete(chatId);
+      pendingPasswordActions.set(chatId, {
+        conversion,
+        fileId: doc.file_id,
+        ext,
+        target: pendingFileAction.target,
+        mode: "command"
+      });
+      return bot.sendMessage(chatId, `🔐 Send password to ${pendingFileAction.target} this PDF.`);
+    }
+
     // Step merge mode: collect PDFs
     const mergeSession = mergeSessions.get(chatId);
     if (mergeSession && ext === ".pdf") {
@@ -1494,7 +1524,14 @@ Limit: ${MAX_MB} MB`;
     }
 
     if (conversion.needsPassword && !password) {
-      return bot.sendMessage(chatId, "🔐 Password required.\nExample: to protect password=1234\nExample: to unlock pass=1234");
+      pendingPasswordActions.set(chatId, {
+        conversion,
+        fileId: doc.file_id,
+        ext,
+        target,
+        mode: "caption"
+      });
+      return bot.sendMessage(chatId, `🔐 Send password to ${target} this PDF.`);
     }
 
     await performConversion({
@@ -1528,7 +1565,6 @@ Limit: ${MAX_MB} MB`;
     }
 
     pendingConversions.delete(token);
-    await bot.answerCallbackQuery(query.id, { text: `Starting ${conversion.label}...` });
 
     // For password/pages, read from the original document caption if available
     const caption = query.message?.caption || query.message?.text || "";
@@ -1536,9 +1572,19 @@ Limit: ${MAX_MB} MB`;
     const pages = parsePages(caption);
 
     if (conversion.needsPassword && !password) {
-      await bot.sendMessage(pending.chatId, "🔐 Password required.\nRe-send PDF with: to protect password=1234 OR to unlock pass=1234");
+      pendingPasswordActions.set(pending.chatId, {
+        conversion,
+        fileId: pending.fileId,
+        ext: pending.ext,
+        target,
+        mode: "button"
+      });
+      await bot.answerCallbackQuery(query.id, { text: "Send password in chat" });
+      await bot.sendMessage(pending.chatId, `🔐 Send password to ${target} this PDF.`);
       return;
     }
+
+    await bot.answerCallbackQuery(query.id, { text: `Starting ${conversion.label}...` });
 
     await performConversion({
       chatId: pending.chatId,
@@ -1547,6 +1593,27 @@ Limit: ${MAX_MB} MB`;
       ext: pending.ext,
       resolvedTarget: target,
       context: { password, pages }
+    });
+  });
+
+
+  bot.on("text", async (msg) => {
+    const chatId = msg.chat.id;
+    const text = (msg.text || "").trim();
+    if (!text || text.startsWith("/")) return;
+
+    const pendingAction = pendingPasswordActions.get(chatId);
+    if (!pendingAction) return;
+
+    pendingPasswordActions.delete(chatId);
+
+    await performConversion({
+      chatId,
+      conversion: pendingAction.conversion,
+      fileId: pendingAction.fileId,
+      ext: pendingAction.ext,
+      resolvedTarget: pendingAction.target,
+      context: { password: text }
     });
   });
 
