@@ -34,7 +34,67 @@ const MAX_MB = 25;
 const MAX_BYTES = MAX_MB * 1024 * 1024;
 const ADMIN_USER_ID = 5695514027;
 const ADMIN_USERNAME = "hayforks";
-const USERS_DB_PATH = path.join(process.cwd(), "data", "users.json");
+const USERS_DB_PATH =
+  process.env.USERS_DB_PATH ||
+  path.join(process.cwd(), "data", "users.json");
+
+async function ensureUsersDbFile() {
+  const dir = path.dirname(USERS_DB_PATH);
+  await fs.mkdir(dir, { recursive: true });
+
+  try {
+    await fs.access(USERS_DB_PATH);
+  } catch {
+    await fs.writeFile(
+      USERS_DB_PATH,
+      JSON.stringify({ users: {} }, null, 2),
+      "utf8"
+    );
+  }
+}
+
+async function loadUsersDb() {
+  await ensureUsersDbFile();
+  const raw = await fs.readFile(USERS_DB_PATH, "utf8");
+
+  try {
+    const db = JSON.parse(raw || "{}");
+    if (!db.users || typeof db.users !== "object") db.users = {};
+    return db;
+  } catch {
+    const db = { users: {} };
+    await fs.writeFile(USERS_DB_PATH, JSON.stringify(db, null, 2), "utf8");
+    return db;
+  }
+}
+
+async function saveUsersDb(db) {
+  await ensureUsersDbFile();
+  await fs.writeFile(USERS_DB_PATH, JSON.stringify(db, null, 2), "utf8");
+}
+
+function normalizeUserRecord(existing, from) {
+  const now = new Date().toISOString();
+  return {
+    userId: String(from?.id || existing?.userId || ""),
+    username: from?.username ? `@${from.username}` : (existing?.username || ""),
+    fullName: [from?.first_name, from?.last_name].filter(Boolean).join(" ") || existing?.fullName || "Unknown",
+    status: existing?.status || "pending",
+    createdAt: existing?.createdAt || now,
+    updatedAt: now,
+    approvedAt: existing?.approvedAt || null,
+    rejectedAt: existing?.rejectedAt || null
+  };
+}
+
+function buildApprovalKeyboard(userId) {
+  return {
+    inline_keyboard: [[
+      { text: "✅ Approve", callback_data: `admin:approve:${userId}` },
+      { text: "❌ Reject", callback_data: `admin:reject:${userId}` }
+    ]]
+  };
+}
 
 // ===== ADMIN CHECK (FIX for: isAdminUser is not defined) =====
 const ADMIN_IDS = (process.env.ADMIN_IDS || "")
