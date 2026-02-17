@@ -1816,26 +1816,58 @@ function startTelegramBot() {
     } catch {}
   });
 
+  let pollingRecoverTimer = null;
+  let pollingRecoveryInProgress = false;
+
   // ✅ Prevent "409 terminated by other getUpdates request" staying broken
   bot.on("polling_error", async (err) => {
     const msg = String(err?.message || "");
     console.log("polling_error:", msg);
 
     if (msg.includes("409") || msg.includes("terminated by other getUpdates request")) {
+      if (pollingRecoveryInProgress) return;
+      pollingRecoveryInProgress = true;
+
+      if (pollingRecoverTimer) {
+        clearTimeout(pollingRecoverTimer);
+        pollingRecoverTimer = null;
+      }
+
       try {
         await bot.stopPolling();
       } catch {}
-      setTimeout(() => {
-        try { bot.startPolling(); } catch {}
+
+      pollingRecoverTimer = setTimeout(async () => {
+        try {
+          await bot.startPolling();
+        } catch {}
+        pollingRecoveryInProgress = false;
+        pollingRecoverTimer = null;
       }, 2500);
     }
   });
 
-  const startText =
-`✨ *Hayforks Premium Converter*
-Fast. Smart. Secure.
+  bot.on("webhook_error", (err) => {
+    console.log("webhook_error:", String(err?.message || err || "unknown webhook error"));
+  });
 
-Send a file to begin conversion.
+  const startText =
+`👋 *Welcome to File Converter Bot*
+
+Send a file and I’ll auto-detect everything you can do with it.
+You’ll get smart buttons for every supported tool.
+
+✨ *Quick Examples:*
+• Send invoice.pdf → tap OCR / Split / Compress / Protect / Unlock
+• Send report.pdf with caption: to docx
+• Send 2+ PDFs together with caption: merge
+• Tap Protect/Unlock → send password when asked
+• Scan mode: /scanpdf → send images → /done
+• Watermark mode: /watermark → send PDF → send watermark image
+
+📦 *Limits:*
+• Max file size: ${MAX_MB} MB
+
 Use /cmds to view all commands.`;
 
   function parseTarget(caption) {
@@ -2231,20 +2263,21 @@ Limit: ${MAX_MB} MB`;
 
   const cmdsText = `📌 Commands
 /start - register / start
+/help - quick help
 /cmds - show this list
 /status - bot status
-/merge - merge PDFs
-/done - finish merge/scan
+/merge - merge PDFs (media-group or step mode)
+/done - finish merge/scan mode
 /cancel - cancel active mode
-/split - split PDF
+/split - split PDF pages
 /compress - compress PDF
-/ocr - OCR PDF
-/translate - translate PDF
-/scanpdf - images to PDF
+/ocr - OCR scanned PDF
+/translate - translate PDF language
+/scanpdf - merge images into one PDF
 /watermark - apply watermark image to PDF
 /rename - rename any file
-/protect - protect PDF/ZIP
-/unlock - unlock PDF/ZIP
+/protect - protect PDF/ZIP with password
+/unlock - unlock PDF/ZIP with password
 /admin - admin panel
 /users - list registered users`; 
 
@@ -2265,6 +2298,7 @@ Use /users to view details.`;
 
   bot.setMyCommands([
     { command: "start", description: "Register / Start" },
+    { command: "help", description: "Quick help" },
     { command: "cmds", description: "Show all commands" },
     { command: "status", description: "Bot status" },
     { command: "merge", description: "Merge PDFs (media group or step mode)" },
@@ -2358,6 +2392,10 @@ ${lines.join("\n")}` : "No registered users yet.");
   bot.onText(/\/unlock/, (msg) => {
     pendingCommandFileActions.set(msg.chat.id, { target: "unlock" });
     bot.sendMessage(msg.chat.id, "🔓 Unlock mode: Please send a PDF or ZIP file first.");
+  });
+  bot.onText(/\/watermark/, (msg) => {
+    pendingCommandFileActions.set(msg.chat.id, { target: "watermark" });
+    bot.sendMessage(msg.chat.id, "🖼️ Watermark mode: send a PDF first, then send watermark image (PNG/JPG/JPEG).");
   });
 
   bot.onText(/\/merge/, (msg) => {
