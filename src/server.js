@@ -1852,10 +1852,22 @@ function startTelegramBot() {
   });
 
   const startText =
-`✨ *Hayforks Premium Converter*
-Fast. Smart. Secure.
+`👋 *Welcome to File Converter Bot*
 
-Send a file to begin conversion.
+Send a file and I’ll auto-detect everything you can do with it.
+You’ll get smart buttons for every supported tool.
+
+✨ *Quick Examples:*
+• Send invoice.pdf → tap OCR / Split / Compress / Protect / Unlock
+• Send report.pdf with caption: to docx
+• Send 2+ PDFs together with caption: merge
+• Tap Protect/Unlock → send password when asked
+• Scan mode: /scanpdf → send images → /done
+• Watermark mode: /watermark → send PDF → send watermark image
+
+📦 *Limits:*
+• Max file size: ${MAX_MB} MB
+
 Use /cmds to view all commands.`;
 
   function parseTarget(caption) {
@@ -2251,20 +2263,21 @@ Limit: ${MAX_MB} MB`;
 
   const cmdsText = `📌 Commands
 /start - register / start
+/help - quick help
 /cmds - show this list
 /status - bot status
-/merge - merge PDFs
-/done - finish merge/scan
+/merge - merge PDFs (media-group or step mode)
+/done - finish merge/scan mode
 /cancel - cancel active mode
-/split - split PDF
+/split - split PDF pages
 /compress - compress PDF
-/ocr - OCR PDF
-/translate - translate PDF
-/scanpdf - images to PDF
+/ocr - OCR scanned PDF
+/translate - translate PDF language
+/scanpdf - merge images into one PDF
 /watermark - apply watermark image to PDF
 /rename - rename any file
-/protect - protect PDF/ZIP
-/unlock - unlock PDF/ZIP
+/protect - protect PDF/ZIP with password
+/unlock - unlock PDF/ZIP with password
 /admin - admin panel
 /users - list registered users`; 
 
@@ -2285,6 +2298,7 @@ Use /users to view details.`;
 
   bot.setMyCommands([
     { command: "start", description: "Register / Start" },
+    { command: "help", description: "Quick help" },
     { command: "cmds", description: "Show all commands" },
     { command: "status", description: "Bot status" },
     { command: "merge", description: "Merge PDFs (media group or step mode)" },
