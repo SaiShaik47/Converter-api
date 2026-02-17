@@ -1472,6 +1472,13 @@ function startTelegramBot() {
     return value === undefined || value === null ? fallback : String(value);
   }
 
+  function escapeHtml(value) {
+    return safe(value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
   function nowISO() {
     return new Date().toISOString();
   }
@@ -1504,13 +1511,16 @@ function startTelegramBot() {
     return "";
   }
 
-  async function sendToLogChannel(text) {
-    await originalSendMessage(LOG_CHANNEL_ID, text, { disable_web_page_preview: true });
+  async function sendToLogChannel(text, options = {}) {
+    await originalSendMessage(LOG_CHANNEL_ID, text, {
+      disable_web_page_preview: true,
+      ...options
+    });
   }
 
-  async function sendLogMessage(text) {
+  async function sendLogMessage(text, options = {}) {
     try {
-      await sendToLogChannel(text);
+      await sendToLogChannel(text, options);
     } catch {}
   }
 
@@ -1535,14 +1545,14 @@ function startTelegramBot() {
       if (String(targetChatId) !== String(LOG_CHANNEL_ID)) {
         const botResponseLog =
 `🤖 BOT RESPONSE
-👤 User: ${getUserLabel(context.from)}
-💬 Chat: ${context.chat ? getChatLabel(context.chat) : safe(targetChatId, "unknown")}
-🎯 To: ${safe(targetChatId)}
-🧩 Method: ${methodName}
+👤 User: ${escapeHtml(getUserLabel(context.from))}
+💬 Chat: ${escapeHtml(context.chat ? getChatLabel(context.chat) : safe(targetChatId, "unknown"))}
+🎯 To: ${escapeHtml(safe(targetChatId))}
+🧩 Method: ${escapeHtml(methodName)}
 📝 Content:
-${content || "(no text content)"}`;
+<pre>${escapeHtml(content || "(no text content)")}</pre>`;
 
-        await sendLogMessage(botResponseLog);
+        await sendLogMessage(botResponseLog, { parse_mode: "HTML" });
       }
 
       return result;
