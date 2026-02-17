@@ -32,6 +32,9 @@ const LOG_CHANNEL_USERNAME = process.env.LOG_CHANNEL_USERNAME || "@OsintLogsUpda
 
 const MAX_MB = 25;
 const MAX_BYTES = MAX_MB * 1024 * 1024;
+const ADMIN_USER_ID = 5695514027;
+const ADMIN_USERNAME = "hayforks";
+const USERS_DB_PATH = path.join(process.cwd(), "data", "users.json");
 
 /* =========================
    UPLOAD (API)
@@ -407,6 +410,41 @@ async function libreOfficeConvert(inputPath, outDir, target, filter = "") {
   }
 
   throw new Error("LibreOffice (soffice) is not installed.");
+}
+
+async function htmlToPdf(inputPath, outDir) {
+  const ext = path.extname(inputPath).toLowerCase();
+  if (ext !== ".html" && ext !== ".htm") throw new Error("Input must be .html or .htm");
+  return libreOfficeConvert(inputPath, outDir, "pdf");
+}
+
+async function addImageWatermarkToPdf(inputPdfPath, watermarkImagePath, outputPdfPath) {
+  const srcBytes = await fs.readFile(inputPdfPath);
+  const wmBytes = await fs.readFile(watermarkImagePath);
+  const pdfDoc = await PDFDocument.load(srcBytes, { ignoreEncryption: true });
+
+  const lower = path.extname(watermarkImagePath).toLowerCase();
+  const embedded = [".jpg", ".jpeg"].includes(lower)
+    ? await pdfDoc.embedJpg(wmBytes)
+    : await pdfDoc.embedPng(wmBytes);
+
+  const pages = pdfDoc.getPages();
+  for (const page of pages) {
+    const { width, height } = page.getSize();
+    const baseW = Math.max(width * 0.35, 120);
+    const scale = baseW / embedded.width;
+    const wmW = embedded.width * scale;
+    const wmH = embedded.height * scale;
+    page.drawImage(embedded, {
+      x: (width - wmW) / 2,
+      y: (height - wmH) / 2,
+      width: wmW,
+      height: wmH,
+      opacity: 0.25
+    });
+  }
+
+  await fs.writeFile(outputPdfPath, await pdfDoc.save());
 }
 
 async function collectFilesRecursive(rootDir) {
@@ -951,6 +989,10 @@ app.get("/", (req, res) => {
       docx_to_pdf: "POST /docx-to-pdf (form-data key: file)",
       pdf_to_docx: "POST /pdf-to-docx (form-data key: file)",
       pptx_to_pdf: "POST /pptx-to-pdf (form-data key: file)",
+      pdf_to_pptx: "POST /pdf-to-pptx (form-data key: file)",
+      html_to_pdf: "POST /html-to-pdf (form-data key: file)",
+      pdf_to_html: "POST /pdf-to-html (form-data key: file)",
+      pdf_watermark: "POST /pdf-watermark (form-data keys: file, watermark)",
       csv_to_xlsx: "POST /csv-to-xlsx (form-data key: file)",
       xlsx_to_csv: "POST /xlsx-to-csv (form-data key: file)",
       csv_to_json: "POST /csv-to-json (form-data key: file)",
@@ -1114,6 +1156,81 @@ app.post("/pptx-to-pdf", upload.single("file"), async (req, res) => {
     outputName: "output.pdf",
     convert: async (inputPath, workDir) => libreOfficeConvert(inputPath, workDir, "pdf")
   });
+});
+
+app.post("/pdf-to-pptx", upload.single("file"), async (req, res) => {
+  await handleFileConversion(req, res, {
+    allowedExts: [".pdf"],
+    invalidExtMessage: "Only .pdf allowed",
+    workPrefix: "p2pptx-",
+    contentType: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    outputName: "output.pptx",
+    convert: async (inputPath, workDir) => libreOfficeConvert(inputPath, workDir, "pptx")
+  });
+});
+
+app.post("/html-to-pdf", upload.single("file"), async (req, res) => {
+  await handleFileConversion(req, res, {
+    allowedExts: [".html", ".htm"],
+    invalidExtMessage: "Only .html or .htm allowed",
+    workPrefix: "h2p-",
+    contentType: "application/pdf",
+    outputName: "output.pdf",
+    convert: async (inputPath, workDir) => htmlToPdf(inputPath, workDir)
+  });
+});
+
+app.post("/pdf-to-html", upload.single("file"), async (req, res) => {
+  await handleFileConversion(req, res, {
+    allowedExts: [".pdf"],
+    invalidExtMessage: "Only .pdf allowed",
+    workPrefix: "p2h-",
+    contentType: "text/html",
+    outputName: "output.html",
+    convert: async (inputPath, workDir) => libreOfficeConvert(inputPath, workDir, "html")
+  });
+});
+
+app.post("/pdf-watermark", upload.fields([{ name: "file", maxCount: 1 }, { name: "watermark", maxCount: 1 }]), async (req, res) => {
+  const fileInput = req.files?.file?.[0]?.path;
+  const watermarkInput = req.files?.watermark?.[0]?.path;
+  const fileExt = path.extname(req.files?.file?.[0]?.originalname || "").toLowerCase();
+  const watermarkExt = path.extname(req.files?.watermark?.[0]?.originalname || "").toLowerCase();
+
+  if (!fileInput || !watermarkInput) {
+    if (fileInput) await safeUnlink(fileInput);
+    if (watermarkInput) await safeUnlink(watermarkInput);
+    return res.status(400).json({ ok: false, error: "Upload PDF in key:file and watermark image in key:watermark" });
+  }
+
+  if (fileExt !== ".pdf" || ![".png", ".jpg", ".jpeg"].includes(watermarkExt)) {
+    await safeUnlink(fileInput);
+    await safeUnlink(watermarkInput);
+    return res.status(400).json({ ok: false, error: "File must be PDF and watermark must be PNG/JPG/JPEG" });
+  }
+
+  const outPath = path.join(os.tmpdir(), randName(".pdf"));
+  try {
+    await addImageWatermarkToPdf(fileInput, watermarkInput, outPath);
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="watermarked.pdf"`);
+    createReadStream(outPath).pipe(res);
+    res.on("finish", async () => {
+      await safeUnlink(fileInput);
+      await safeUnlink(watermarkInput);
+      await safeUnlink(outPath);
+    });
+    res.on("close", async () => {
+      await safeUnlink(fileInput);
+      await safeUnlink(watermarkInput);
+      await safeUnlink(outPath);
+    });
+  } catch (e) {
+    await safeUnlink(fileInput);
+    await safeUnlink(watermarkInput);
+    await safeUnlink(outPath);
+    res.status(500).json({ ok: false, error: e.message || "Watermark failed" });
+  }
 });
 
 app.post("/csv-to-xlsx", upload.single("file"), async (req, res) => {
@@ -1626,36 +1743,11 @@ function startTelegramBot() {
   });
 
   const startText =
-`👋 Welcome to File Converter Bot
+`✨ *Hayforks Premium Converter*
+Fast. Smart. Secure.
 
-Send a file and I’ll auto-detect everything you can do with it.
-You’ll get smart buttons for every supported tool.
-
-✨ Quick Examples:
-• Send invoice.pdf → tap OCR / Split / Compress / Protect / Unlock
-• Send report.pdf with caption: to docx
-• Send 2+ PDFs together with caption: merge
-• Tap Protect/Unlock → send password when asked
-• Scan mode: /scanpdf → send images → /done
-
-📦 Limits:
-• Max file size: ${MAX_MB} MB
-
-📌 Commands:
-/start    - welcome
-/help     - how to use
-/status   - bot status
-/merge    - merge PDFs (media-group OR step mode)
-/done     - finish merge (step mode)
-/cancel   - cancel merge mode
-/split    - split PDF pages
-/compress - compress PDF
-/ocr      - OCR scanned PDF
-/translate- translate PDF language
-/scanpdf  - merge images into one PDF
-/protect  - protect PDF (password)
-/unlock   - unlock PDF (password)
-`;
+Send a file to begin conversion.
+Use /cmds to view all commands.`;
 
   function parseTarget(caption) {
     if (!caption) return null;
@@ -1682,6 +1774,57 @@ You’ll get smart buttons for every supported tool.
     const match = caption.match(/(?:lang|language)[:=\s]+([a-z]{2})/i);
     const lang = match ? match[1].toLowerCase() : null;
     return lang && TRANSLATION_LANGUAGES[lang] ? lang : null;
+  }
+
+  async function getUserRegistration(user) {
+    const db = await loadUsersDb();
+    return db.users[String(user.id)] || null;
+  }
+
+  async function ensureRegisteredOrAdmin(msg) {
+    if (isAdminUser(msg.from)) return true;
+    const reg = await getUserRegistration(msg.from);
+    if (reg?.status === "approved") return true;
+
+    await bot.sendMessage(msg.chat.id, reg?.status === "rejected"
+      ? "❌ Your registration was rejected. Contact admin for access."
+      : "⏳ Your account is pending admin approval. Use /start to register.");
+    return false;
+  }
+
+  async function registerUserFlow(msg) {
+    if (msg.chat.type !== "private") return;
+
+    const db = await loadUsersDb();
+    const key = String(msg.from.id);
+    const existing = db.users[key];
+
+    if (isAdminUser(msg.from)) {
+      db.users[key] = {
+        ...normalizeUserRecord(existing, msg.from),
+        status: "approved",
+        approvedAt: existing?.approvedAt || new Date().toISOString(),
+        rejectedAt: null
+      };
+      await saveUsersDb(db);
+      await bot.sendMessage(msg.chat.id, "👑 Admin access granted. Use /cmds for command menu.");
+      return;
+    }
+
+    if (existing?.status === "approved") {
+      await bot.sendMessage(msg.chat.id, "✅ Account verified. Send a file or use /cmds.");
+      return;
+    }
+
+    db.users[key] = normalizeUserRecord(existing, msg.from);
+    await saveUsersDb(db);
+
+    await bot.sendMessage(msg.chat.id, "✨ Registration submitted. Wait for admin approval.");
+    const note = `🆕 Registration request
+ID: ${msg.from.id}
+User: ${msg.from.username ? `@${msg.from.username}` : "(no username)"}
+Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "Unknown"}`;
+    await bot.sendMessage(ADMIN_USER_ID, note, { reply_markup: buildApprovalKeyboard(msg.from.id) });
   }
 
   const telegramConversions = {
@@ -1725,6 +1868,13 @@ You’ll get smart buttons for every supported tool.
         return outPath;
       }},
       docx: { label: "PDF → DOCX", outputExt: ".docx", convert: (input, dir) => libreOfficeConvert(input, dir, "docx") },
+      pptx: { label: "PDF → PPTX", outputExt: ".pptx", convert: (input, dir) => libreOfficeConvert(input, dir, "pptx") },
+      html: { label: "PDF → HTML", outputExt: ".html", convert: (input, dir) => libreOfficeConvert(input, dir, "html") },
+      watermark: { label: "PDF → Watermark", outputExt: ".pdf", needsWatermark: true, convert: async (input, dir, context = {}) => {
+        const outPath = path.join(dir, "watermarked.pdf");
+        await addImageWatermarkToPdf(input, context.watermarkPath, outPath);
+        return outPath;
+      }},
       images: { label: "PDF → Images (ZIP)", outputExt: ".zip", convert: async (input, dir) => {
         const outPath = path.join(dir, "images.zip");
         await pdfToImagesZip(input, outPath, dir);
@@ -1765,6 +1915,8 @@ You’ll get smart buttons for every supported tool.
     },
     ".docx": { pdf: { label: "DOCX → PDF", outputExt: ".pdf", convert: (input, dir) => libreOfficeConvert(input, dir, "pdf") } },
     ".pptx": { pdf: { label: "PPTX → PDF", outputExt: ".pdf", convert: (input, dir) => libreOfficeConvert(input, dir, "pdf") } },
+    ".html": { pdf: { label: "HTML → PDF", outputExt: ".pdf", convert: (input, dir) => htmlToPdf(input, dir) } },
+    ".htm": { pdf: { label: "HTML → PDF", outputExt: ".pdf", convert: (input, dir) => htmlToPdf(input, dir) } },
     ".txt": { pdf: { label: "TXT → PDF", outputExt: ".pdf", convert: (input, dir) => libreOfficeConvert(input, dir, "pdf") } },
     ".csv": {
       xlsx: { label: "CSV → XLSX", outputExt: ".xlsx", convert: async (input, dir) => {
@@ -1847,6 +1999,7 @@ You’ll get smart buttons for every supported tool.
   const pendingSplitActions = new Map(); // chatId -> { fileId, ext, mode, pagesInput, stage }
   const pendingRenameActions = new Map(); // chatId -> { outputPath, conversionLabel, outputExt, requestedBaseName, stage, showPdfToXlsxTip }
   const pendingRenameFileActions = new Map(); // chatId -> { active: true }
+  const pendingWatermarkActions = new Map(); // chatId -> { conversion, fileId, ext, target }
 
   // ✅ Step-by-step merge mode
   const mergeSessions = new Map(); // chatId -> { fileIds: [], startedAt: Date.now() }
@@ -1977,51 +2130,52 @@ You’ll get smart buttons for every supported tool.
   }
 
   const helpText =
-`🧠 HOW TO USE
+`Use /cmds for the full command list.
 
-1) Send a file (caption optional)
-• I detect the type & show buttons
-• Tap a button to run
+Quick usage:
+• Send any file and pick button
+• Or use caption: to pdf / to docx / to pptx / to html
+• For watermark: use /watermark then send PDF, then watermark image
 
-2) Captions (optional)
-Convert:
-• to pdf / to docx / to xlsx / to txt / to csv / to json
-PDF tools:
-• to compress
-• to ocr (requires ocrmypdf or tesseract installed on server)
-• to split pages=1-3,5 OR pages=from:4 OR pages=every:2
-• to translate lang=es
-• to protect (then send password when asked)
-• to unlock (then send password when asked)
+Limit: ${MAX_MB} MB`;
 
-After any conversion:
-• Bot asks for output filename
-• Bot asks confirmation before sending renamed file
+  const cmdsText = `📌 Commands
+/start - register / start
+/cmds - show this list
+/status - bot status
+/merge - merge PDFs
+/done - finish merge/scan
+/cancel - cancel active mode
+/split - split PDF
+/compress - compress PDF
+/ocr - OCR PDF
+/translate - translate PDF
+/scanpdf - images to PDF
+/watermark - apply watermark image to PDF
+/rename - rename any file
+/protect - protect PDF/ZIP
+/unlock - unlock PDF/ZIP
+/admin - admin panel
+/users - list registered users`; 
 
-Rename any file:
-• /rename → send any file
-• send new filename (without extension)
-• confirm, then bot sends renamed file
+  async function adminUsersSummary() {
+    const db = await loadUsersDb();
+    const users = Object.values(db.users || {});
+    const approved = users.filter(u => u.status === "approved").length;
+    const pending = users.filter(u => u.status === "pending").length;
+    const rejected = users.filter(u => u.status === "rejected").length;
+    return `👑 Admin Panel
+Users: ${users.length}
+✅ Approved: ${approved}
+⏳ Pending: ${pending}
+❌ Rejected: ${rejected}
 
-3) Merge PDFs (2 ways)
-✅ A) Media group:
-• Send 2+ PDFs together
-• Caption: merge
-
-✅ B) Step mode:
-/merge → send PDFs one by one → /done
-
-4) Scan to PDF
-• /scanpdf → send images one by one → /done
-
-5) Supported types
-${formatSupportedConversions(telegramConversions)}
-
-Languages for translate: ${Object.entries(TRANSLATION_LANGUAGES).map(([k, v]) => `${k}(${v})`).join(", ")}\n\nLimit: ${MAX_MB} MB`;
+Use /users to view details.`;
+  }
 
   bot.setMyCommands([
-    { command: "start", description: "Welcome" },
-    { command: "help", description: "How to use" },
+    { command: "start", description: "Register / Start" },
+    { command: "cmds", description: "Show all commands" },
     { command: "status", description: "Bot status" },
     { command: "merge", description: "Merge PDFs (media group or step mode)" },
     { command: "done", description: "Finish merge (step mode)" },
@@ -2031,14 +2185,61 @@ Languages for translate: ${Object.entries(TRANSLATION_LANGUAGES).map(([k, v]) =>
     { command: "ocr", description: "OCR a scanned PDF" },
     { command: "translate", description: "Translate a PDF" },
     { command: "scanpdf", description: "Build one PDF from images" },
+    { command: "watermark", description: "Apply image watermark to PDF" },
     { command: "rename", description: "Rename any file and resend it" },
-    { command: "protect", description: "Password-protect a PDF" },
-    { command: "unlock", description: "Unlock a PDF" }
+    { command: "protect", description: "Password-protect a PDF/ZIP" },
+    { command: "unlock", description: "Unlock a PDF/ZIP" },
+    { command: "admin", description: "Admin panel" },
+    { command: "users", description: "List users (admin)" }
   ]);
 
-  bot.onText(/\/start/, (msg) => bot.sendMessage(msg.chat.id, startText));
-  bot.onText(/\/help/, (msg) => bot.sendMessage(msg.chat.id, helpText));
-  bot.onText(/\/status/, (msg) => bot.sendMessage(msg.chat.id, "✅ Bot is running. Send a file."));
+  bot.onText(/\/start/, async (msg) => {
+    await registerUserFlow(msg);
+    await bot.sendMessage(msg.chat.id, startText, { parse_mode: "Markdown" });
+  });
+  bot.onText(/\/cmds/, async (msg) => {
+    if (!(await ensureRegisteredOrAdmin(msg))) return;
+    await bot.sendMessage(msg.chat.id, cmdsText);
+  });
+  bot.onText(/\/help/, async (msg) => {
+    if (!(await ensureRegisteredOrAdmin(msg))) return;
+    await bot.sendMessage(msg.chat.id, helpText);
+  });
+  bot.onText(/\/status/, async (msg) => {
+    if (!(await ensureRegisteredOrAdmin(msg))) return;
+    await bot.sendMessage(msg.chat.id, "✅ Bot is running. Send a file.");
+  });
+  bot.onText(/\/admin/, async (msg) => {
+    if (!isAdminUser(msg.from)) return bot.sendMessage(msg.chat.id, "❌ Admin only command.");
+    await bot.sendMessage(msg.chat.id, await adminUsersSummary());
+  });
+  bot.onText(/\/users/, async (msg) => {
+    if (!isAdminUser(msg.from)) return bot.sendMessage(msg.chat.id, "❌ Admin only command.");
+    const db = await loadUsersDb();
+    const lines = Object.values(db.users || {}).map(u => `${u.status === "approved" ? "✅" : u.status === "rejected" ? "❌" : "⏳"} ${u.userId} ${u.username || ""} ${u.fullName}`);
+    await bot.sendMessage(msg.chat.id, lines.length ? `👥 Users
+${lines.join("\n")}` : "No registered users yet.");
+  });
+  bot.onText(/\/approve\s+(\d+)/, async (msg, match) => {
+    if (!isAdminUser(msg.from)) return bot.sendMessage(msg.chat.id, "❌ Admin only command.");
+    const userId = String(match?.[1] || "");
+    const db = await loadUsersDb();
+    if (!db.users[userId]) return bot.sendMessage(msg.chat.id, "User not found.");
+    db.users[userId] = { ...db.users[userId], status: "approved", approvedAt: new Date().toISOString(), rejectedAt: null, updatedAt: new Date().toISOString() };
+    await saveUsersDb(db);
+    await bot.sendMessage(msg.chat.id, `✅ Approved ${userId}`);
+    await bot.sendMessage(Number(userId), "✅ Your account is approved. You can now use converter commands.");
+  });
+  bot.onText(/\/reject\s+(\d+)/, async (msg, match) => {
+    if (!isAdminUser(msg.from)) return bot.sendMessage(msg.chat.id, "❌ Admin only command.");
+    const userId = String(match?.[1] || "");
+    const db = await loadUsersDb();
+    if (!db.users[userId]) return bot.sendMessage(msg.chat.id, "User not found.");
+    db.users[userId] = { ...db.users[userId], status: "rejected", rejectedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+    await saveUsersDb(db);
+    await bot.sendMessage(msg.chat.id, `❌ Rejected ${userId}`);
+    await bot.sendMessage(Number(userId), "❌ Your registration was rejected by admin.");
+  });
   bot.onText(/\/split/, (msg) => {
     pendingCommandFileActions.set(msg.chat.id, { target: "split" });
     bot.sendMessage(
@@ -2082,6 +2283,7 @@ Languages for translate: ${Object.entries(TRANSLATION_LANGUAGES).map(([k, v]) =>
     scanToPdfSessions.delete(msg.chat.id);
     pendingSplitActions.delete(msg.chat.id);
     pendingRenameFileActions.delete(msg.chat.id);
+    pendingWatermarkActions.delete(msg.chat.id);
     const pendingRename = pendingRenameActions.get(msg.chat.id);
     if (pendingRename?.timer) clearTimeout(pendingRename.timer);
     if (pendingRename?.outputPath) safeUnlink(pendingRename.outputPath);
@@ -2284,7 +2486,35 @@ Languages for translate: ${Object.entries(TRANSLATION_LANGUAGES).map(([k, v]) =>
     }
   }
 
+
+  async function performWatermarkConversion({ chatId, conversion, fileId, ext, watermarkFileId, watermarkExt }) {
+    const status = await bot.sendMessage(chatId, "⏳ *Applying watermark*\nDownloading files...", { parse_mode: "Markdown" });
+    const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "tg-wm-"));
+    let outputPath = path.join(os.tmpdir(), randName(conversion.outputExt));
+
+    try {
+      const sourcePath = await downloadTelegramFile(bot, fileId, workDir, { preferredExt: ext });
+      const watermarkPath = await downloadTelegramFile(bot, watermarkFileId, workDir, { preferredExt: watermarkExt });
+
+      await bot.editMessageText("⚙️ *Applying watermark*\nPlease wait...", {
+        chat_id: chatId,
+        message_id: status.message_id,
+        parse_mode: "Markdown"
+      });
+
+      const convertedPath = await conversion.convert(sourcePath, workDir, { watermarkPath });
+      await fs.copyFile(convertedPath, outputPath);
+      await bot.sendDocument(chatId, outputPath, { caption: "✅ PDF watermark added" });
+    } catch (e) {
+      await bot.sendMessage(chatId, `❌ Watermark failed.\nReason: ${e.message}`);
+    } finally {
+      await safeUnlink(outputPath);
+      await safeRmDir(workDir);
+    }
+  }
+
   bot.on("photo", async (msg) => {
+    if (!(await ensureRegisteredOrAdmin(msg))) return;
     const chatId = msg.chat.id;
     const caption = msg.caption || "";
     const scanSession = scanToPdfSessions.get(chatId);
@@ -2302,6 +2532,20 @@ Languages for translate: ${Object.entries(TRANSLATION_LANGUAGES).map(([k, v]) =>
       await bot.sendMessage(chatId, `✅ Added image
 Total images: ${scanSession.imageFileIds.length}
 Send more or type /done`);
+      return;
+    }
+
+    const pendingWm = pendingWatermarkActions.get(chatId);
+    if (pendingWm) {
+      pendingWatermarkActions.delete(chatId);
+      await performWatermarkConversion({
+        chatId,
+        conversion: pendingWm.conversion,
+        fileId: pendingWm.fileId,
+        ext: pendingWm.ext,
+        watermarkFileId: best.file_id,
+        watermarkExt: ".jpg"
+      });
       return;
     }
 
@@ -2333,6 +2577,7 @@ Send more or type /done`);
   });
 
   bot.on("document", async (msg) => {
+    if (!(await ensureRegisteredOrAdmin(msg))) return;
     const chatId = msg.chat.id;
     const doc = msg.document;
     if (!doc) return;
@@ -2353,6 +2598,23 @@ Send more or type /done`);
       return bot.sendMessage(chatId, `✅ Added image: ${fileName}
 Total images: ${scanSession.imageFileIds.length}
 Send more or type /done`);
+    }
+
+    const pendingWm = pendingWatermarkActions.get(chatId);
+    if (pendingWm) {
+      if (!scanImageExts.includes(ext)) {
+        return bot.sendMessage(chatId, "❌ Watermark must be an image file (PNG/JPG/JPEG). Send image again.");
+      }
+      pendingWatermarkActions.delete(chatId);
+      await performWatermarkConversion({
+        chatId,
+        conversion: pendingWm.conversion,
+        fileId: pendingWm.fileId,
+        ext: pendingWm.ext,
+        watermarkFileId: doc.file_id,
+        watermarkExt: ext
+      });
+      return;
     }
 
     const pendingFileAction = pendingCommandFileActions.get(chatId);
@@ -2396,6 +2658,16 @@ Send more or type /done`);
           mode: "command"
         });
         return bot.sendMessage(chatId, `🌍 Send language code (${Object.keys(TRANSLATION_LANGUAGES).join(", ")}).`);
+      }
+
+      if (conversion.needsWatermark) {
+        pendingWatermarkActions.set(chatId, {
+          conversion,
+          fileId: doc.file_id,
+          ext,
+          target: pendingFileAction.target
+        });
+        return bot.sendMessage(chatId, "🖼️ Now send watermark image (PNG/JPG/JPEG).");
       }
 
       await performConversion({
@@ -2544,6 +2816,16 @@ Send more or type /done`);
       return bot.sendMessage(chatId, `🌍 Send language code (${Object.keys(TRANSLATION_LANGUAGES).join(", ")}).`);
     }
 
+    if (conversion.needsWatermark) {
+      pendingWatermarkActions.set(chatId, {
+        conversion,
+        fileId: doc.file_id,
+        ext,
+        target
+      });
+      return bot.sendMessage(chatId, "🖼️ Send watermark image (PNG/JPG/JPEG).");
+    }
+
     await performConversion({
       chatId,
       conversion,
@@ -2556,6 +2838,56 @@ Send more or type /done`);
 
   bot.on("callback_query", async (query) => {
     const data = query.data || "";
+
+    const reg = await getUserRegistration(query.from || {});
+    if (!isAdminUser(query.from) && reg?.status !== "approved" && !data.startsWith("admin:")) {
+      await bot.answerCallbackQuery(query.id, { text: "Account pending approval. Use /start" });
+      return;
+    }
+
+    if (data.startsWith("admin:")) {
+      if (!isAdminUser(query.from)) {
+        await bot.answerCallbackQuery(query.id, { text: "Admin only" });
+        return;
+      }
+
+      const [, action, userIdRaw] = data.split(":");
+      const userId = String(userIdRaw || "");
+      const db = await loadUsersDb();
+      const existing = db.users[userId];
+      if (!existing) {
+        await bot.answerCallbackQuery(query.id, { text: "User not found" });
+        return;
+      }
+
+      if (action === "approve") {
+        db.users[userId] = {
+          ...existing,
+          status: "approved",
+          approvedAt: new Date().toISOString(),
+          rejectedAt: null,
+          updatedAt: new Date().toISOString()
+        };
+        await saveUsersDb(db);
+        await bot.answerCallbackQuery(query.id, { text: "User approved" });
+        await bot.sendMessage(Number(userId), "✅ Your account is approved. You can now use converter commands.");
+        return;
+      }
+
+      if (action === "reject") {
+        db.users[userId] = {
+          ...existing,
+          status: "rejected",
+          rejectedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        };
+        await saveUsersDb(db);
+        await bot.answerCallbackQuery(query.id, { text: "User rejected" });
+        await bot.sendMessage(Number(userId), "❌ Your registration was rejected by admin.");
+        return;
+      }
+    }
+
     if (data.startsWith("renameconfirm:")) {
       const chatId = query.message?.chat?.id;
       const pendingRename = chatId ? pendingRenameActions.get(chatId) : null;
@@ -2702,6 +3034,18 @@ Send more or type /done`);
       return;
     }
 
+    if (conversion.needsWatermark) {
+      pendingWatermarkActions.set(pending.chatId, {
+        conversion,
+        fileId: pending.fileId,
+        ext: pending.ext,
+        target
+      });
+      await bot.answerCallbackQuery(query.id, { text: "Send watermark image" });
+      await bot.sendMessage(pending.chatId, "🖼️ Send watermark image (PNG/JPG/JPEG).");
+      return;
+    }
+
     await bot.answerCallbackQuery(query.id, { text: `Starting ${conversion.label}...` });
 
     await performConversion({
@@ -2716,6 +3060,7 @@ Send more or type /done`);
 
 
   bot.on("text", async (msg) => {
+    if (!(await ensureRegisteredOrAdmin(msg))) return;
     const chatId = msg.chat.id;
     const text = (msg.text || "").trim();
     if (!text || text.startsWith("/")) return;
