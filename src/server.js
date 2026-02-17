@@ -1816,19 +1816,39 @@ function startTelegramBot() {
     } catch {}
   });
 
+  let pollingRecoverTimer = null;
+  let pollingRecoveryInProgress = false;
+
   // ✅ Prevent "409 terminated by other getUpdates request" staying broken
   bot.on("polling_error", async (err) => {
     const msg = String(err?.message || "");
     console.log("polling_error:", msg);
 
     if (msg.includes("409") || msg.includes("terminated by other getUpdates request")) {
+      if (pollingRecoveryInProgress) return;
+      pollingRecoveryInProgress = true;
+
+      if (pollingRecoverTimer) {
+        clearTimeout(pollingRecoverTimer);
+        pollingRecoverTimer = null;
+      }
+
       try {
         await bot.stopPolling();
       } catch {}
-      setTimeout(() => {
-        try { bot.startPolling(); } catch {}
+
+      pollingRecoverTimer = setTimeout(async () => {
+        try {
+          await bot.startPolling();
+        } catch {}
+        pollingRecoveryInProgress = false;
+        pollingRecoverTimer = null;
       }, 2500);
     }
+  });
+
+  bot.on("webhook_error", (err) => {
+    console.log("webhook_error:", String(err?.message || err || "unknown webhook error"));
   });
 
   const startText =
@@ -2358,6 +2378,10 @@ ${lines.join("\n")}` : "No registered users yet.");
   bot.onText(/\/unlock/, (msg) => {
     pendingCommandFileActions.set(msg.chat.id, { target: "unlock" });
     bot.sendMessage(msg.chat.id, "🔓 Unlock mode: Please send a PDF or ZIP file first.");
+  });
+  bot.onText(/\/watermark/, (msg) => {
+    pendingCommandFileActions.set(msg.chat.id, { target: "watermark" });
+    bot.sendMessage(msg.chat.id, "🖼️ Watermark mode: send a PDF first, then send watermark image (PNG/JPG/JPEG).");
   });
 
   bot.onText(/\/merge/, (msg) => {
