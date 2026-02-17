@@ -1908,9 +1908,13 @@ Use /cmds to view all commands.`;
     const reg = await getUserRegistration(msg.from);
     if (reg?.status === "approved") return true;
 
-    await bot.sendMessage(msg.chat.id, reg?.status === "rejected"
+    const accessMessage = reg?.status === "rejected"
       ? "❌ Your registration was rejected. Contact admin for access."
-      : "⏳ Your account is pending admin approval. Use /register to request access.");
+      : reg?.status === "pending"
+      ? "⏳ Your account is pending admin approval."
+      : "👋 To use this bot, send /register first.";
+
+    await bot.sendMessage(msg.chat.id, accessMessage);
     return false;
   }
 
@@ -3040,7 +3044,10 @@ Send more or type /done`);
 
     const reg = await getUserRegistration(query.from || {});
     if (!isAdminUser(query.from) && reg?.status !== "approved" && !data.startsWith("admin:")) {
-      await bot.answerCallbackQuery(query.id, { text: "Account pending approval. Use /register" });
+      const message = reg?.status === "pending"
+        ? "Account pending approval"
+        : "Use /register first";
+      await bot.answerCallbackQuery(query.id, { text: message });
       return;
     }
 
@@ -3055,18 +3062,35 @@ Send more or type /done`);
       if (action === "approve") {
         const approvedBy = query.from?.username ? `@${query.from.username}` : String(query.from?.id || "admin");
         const result = await approveUser(userId, approvedBy);
-        await bot.answerCallbackQuery(query.id, { text: result.ok ? "User approved" : result.reason });
+        await bot.answerCallbackQuery(query.id);
         if (result.ok) {
-          await bot.sendMessage(query.message?.chat?.id, `✅ Approved ${userId}`);
+          const baseText = query.message?.text || "🆕 Registration request";
+          const updatedText = `${baseText}\n\n✅ Approved by ${approvedBy}`;
+          await bot.editMessageText(updatedText, {
+            chat_id: query.message?.chat?.id,
+            message_id: query.message?.message_id,
+            reply_markup: { inline_keyboard: [] }
+          });
+        } else {
+          await bot.answerCallbackQuery(query.id, { text: result.reason });
         }
         return;
       }
 
       if (action === "reject") {
         const result = await rejectUser(userId);
-        await bot.answerCallbackQuery(query.id, { text: result.ok ? "User rejected" : result.reason });
+        await bot.answerCallbackQuery(query.id);
         if (result.ok) {
-          await bot.sendMessage(query.message?.chat?.id, `❌ Rejected ${userId}`);
+          const rejectedBy = query.from?.username ? `@${query.from.username}` : String(query.from?.id || "admin");
+          const baseText = query.message?.text || "🆕 Registration request";
+          const updatedText = `${baseText}\n\n❌ Rejected by ${rejectedBy}`;
+          await bot.editMessageText(updatedText, {
+            chat_id: query.message?.chat?.id,
+            message_id: query.message?.message_id,
+            reply_markup: { inline_keyboard: [] }
+          });
+        } else {
+          await bot.answerCallbackQuery(query.id, { text: result.reason });
         }
         return;
       }
