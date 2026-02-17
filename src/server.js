@@ -1581,13 +1581,13 @@ function startTelegramBot() {
 
       const commandLog =
 `📩 COMMAND
-👤 User: ${getUserLabel(msg.from)}
-💬 Chat: ${getChatLabel(msg.chat)}
-🕒 Time: ${nowISO()}
+👤 User: ${escapeHtml(getUserLabel(msg.from))}
+💬 Chat: ${escapeHtml(getChatLabel(msg.chat))}
+🕒 Time: ${escapeHtml(nowISO())}
 🧾 Input:
-${extractInputFromMessage(msg)}`;
+<pre>${escapeHtml(extractInputFromMessage(msg))}</pre>`;
 
-      await sendLogMessage(commandLog);
+      await sendLogMessage(commandLog, { parse_mode: "HTML" });
     } catch {}
   });
 
@@ -1600,13 +1600,13 @@ ${extractInputFromMessage(msg)}`;
 
       const commandLog =
 `📩 COMMAND
-👤 User: ${getUserLabel(query.from)}
-💬 Chat: ${getChatLabel(chat)}
-🕒 Time: ${nowISO()}
+👤 User: ${escapeHtml(getUserLabel(query.from))}
+💬 Chat: ${escapeHtml(getChatLabel(chat))}
+🕒 Time: ${escapeHtml(nowISO())}
 🧾 Input:
-callback: ${safe(query.data, "(none)")}`;
+<pre>callback: ${escapeHtml(safe(query.data, "(none)"))}</pre>`;
 
-      await sendLogMessage(commandLog);
+      await sendLogMessage(commandLog, { parse_mode: "HTML" });
     } catch {}
   });
 
