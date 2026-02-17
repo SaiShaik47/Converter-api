@@ -36,6 +36,35 @@ const ADMIN_USER_ID = 5695514027;
 const ADMIN_USERNAME = "hayforks";
 const USERS_DB_PATH = path.join(process.cwd(), "data", "users.json");
 
+// ===== ADMIN CHECK (FIX for: isAdminUser is not defined) =====
+const ADMIN_IDS = (process.env.ADMIN_IDS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean)
+  .map(Number);
+
+const ADMIN_USERNAMES = (process.env.ADMIN_USERNAMES || "")
+  .split(",")
+  .map((s) => s.trim().replace(/^@/, "").toLowerCase())
+  .filter(Boolean);
+
+function isAdminUser(from) {
+  if (!from) return false;
+
+  // Admin by Telegram numeric user id
+  if (Number.isFinite(from.id) && ADMIN_IDS.includes(from.id)) return true;
+
+  // Backward compatible default admin values
+  if (from.id === ADMIN_USER_ID) return true;
+
+  // Optional: admin by username (less reliable than id)
+  const uname = (from.username || "").toLowerCase();
+  if (uname && (ADMIN_USERNAMES.includes(uname) || uname === ADMIN_USERNAME.toLowerCase())) return true;
+
+  return false;
+}
+// ============================================================
+
 /* =========================
    UPLOAD (API)
 ========================= */
@@ -1782,7 +1811,8 @@ Use /cmds to view all commands.`;
   }
 
   async function ensureRegisteredOrAdmin(msg) {
-    if (isAdminUser(msg.from)) return true;
+    if (msg?.from && isAdminUser(msg.from)) return true;
+    if (!msg?.from) return false;
     const reg = await getUserRegistration(msg.from);
     if (reg?.status === "approved") return true;
 
