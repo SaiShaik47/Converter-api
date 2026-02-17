@@ -1910,8 +1910,43 @@ Use /cmds to view all commands.`;
 
     await bot.sendMessage(msg.chat.id, reg?.status === "rejected"
       ? "❌ Your registration was rejected. Contact admin for access."
-      : "⏳ Your account is pending admin approval. Use /start to register.");
+      : "⏳ Your account is pending admin approval. Use /register to request access.");
     return false;
+  }
+
+  async function approveUser(userId, approvedBy) {
+    const db = await loadUsersDb();
+    const key = String(userId);
+    const existing = db.users[key];
+    if (!existing) return { ok: false, reason: "User not found." };
+
+    db.users[key] = {
+      ...existing,
+      status: "approved",
+      approvedAt: new Date().toISOString(),
+      rejectedAt: null,
+      updatedAt: new Date().toISOString()
+    };
+    await saveUsersDb(db);
+    await bot.sendMessage(Number(userId), `✅ Your account has been approved by admin (${approvedBy}).\n\n${startText}`, { parse_mode: "Markdown" });
+    return { ok: true };
+  }
+
+  async function rejectUser(userId) {
+    const db = await loadUsersDb();
+    const key = String(userId);
+    const existing = db.users[key];
+    if (!existing) return { ok: false, reason: "User not found." };
+
+    db.users[key] = {
+      ...existing,
+      status: "rejected",
+      rejectedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    await saveUsersDb(db);
+    await bot.sendMessage(Number(userId), "❌ Your registration was rejected by admin.");
+    return { ok: true };
   }
 
   async function registerUserFlow(msg) {
@@ -1929,7 +1964,6 @@ Use /cmds to view all commands.`;
         rejectedAt: null
       };
       await saveUsersDb(db);
-      await bot.sendMessage(msg.chat.id, "👑 Admin access granted. Use /cmds for command menu.");
       return;
     }
 
@@ -2262,7 +2296,8 @@ Quick usage:
 Limit: ${MAX_MB} MB`;
 
   const cmdsText = `📌 Commands
-/start - register / start
+/start - start bot
+/register - send access request
 /help - quick help
 /cmds - show this list
 /status - bot status
@@ -2297,7 +2332,8 @@ Use /users to view details.`;
   }
 
   bot.setMyCommands([
-    { command: "start", description: "Register / Start" },
+    { command: "start", description: "Start bot" },
+    { command: "register", description: "Request access approval" },
     { command: "help", description: "Quick help" },
     { command: "cmds", description: "Show all commands" },
     { command: "status", description: "Bot status" },
@@ -2318,8 +2354,33 @@ Use /users to view details.`;
   ]);
 
   bot.onText(/\/start/, async (msg) => {
+    if (isAdminUser(msg.from)) {
+      await registerUserFlow(msg);
+      await bot.sendMessage(msg.chat.id, startText, { parse_mode: "Markdown" });
+      return;
+    }
+
+    const reg = await getUserRegistration(msg.from || {});
+    if (reg?.status === "approved") {
+      await bot.sendMessage(msg.chat.id, startText, { parse_mode: "Markdown" });
+      return;
+    }
+
+    if (reg?.status === "rejected") {
+      await bot.sendMessage(msg.chat.id, "❌ Your registration was rejected. Contact admin for access.");
+      return;
+    }
+
+    await bot.sendMessage(msg.chat.id, "👋 Welcome. To use this bot, send /register and wait for admin approval.");
+  });
+  bot.onText(/\/register/, async (msg) => {
+    if (isAdminUser(msg.from)) {
+      await registerUserFlow(msg);
+      await bot.sendMessage(msg.chat.id, startText, { parse_mode: "Markdown" });
+      return;
+    }
+
     await registerUserFlow(msg);
-    await bot.sendMessage(msg.chat.id, startText, { parse_mode: "Markdown" });
   });
   bot.onText(/\/cmds/, async (msg) => {
     if (!(await ensureRegisteredOrAdmin(msg))) return;
@@ -2347,58 +2408,66 @@ ${lines.join("\n")}` : "No registered users yet.");
   bot.onText(/\/approve\s+(\d+)/, async (msg, match) => {
     if (!isAdminUser(msg.from)) return bot.sendMessage(msg.chat.id, "❌ Admin only command.");
     const userId = String(match?.[1] || "");
-    const db = await loadUsersDb();
-    if (!db.users[userId]) return bot.sendMessage(msg.chat.id, "User not found.");
-    db.users[userId] = { ...db.users[userId], status: "approved", approvedAt: new Date().toISOString(), rejectedAt: null, updatedAt: new Date().toISOString() };
-    await saveUsersDb(db);
+    const result = await approveUser(userId, msg.from?.username ? `@${msg.from.username}` : String(msg.from?.id || "admin"));
+    if (!result.ok) return bot.sendMessage(msg.chat.id, `❌ ${result.reason}`);
     await bot.sendMessage(msg.chat.id, `✅ Approved ${userId}`);
-    await bot.sendMessage(Number(userId), "✅ Your account is approved. You can now use converter commands.");
   });
   bot.onText(/\/reject\s+(\d+)/, async (msg, match) => {
     if (!isAdminUser(msg.from)) return bot.sendMessage(msg.chat.id, "❌ Admin only command.");
     const userId = String(match?.[1] || "");
-    const db = await loadUsersDb();
-    if (!db.users[userId]) return bot.sendMessage(msg.chat.id, "User not found.");
-    db.users[userId] = { ...db.users[userId], status: "rejected", rejectedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
-    await saveUsersDb(db);
+    const result = await rejectUser(userId);
+    if (!result.ok) return bot.sendMessage(msg.chat.id, `❌ ${result.reason}`);
     await bot.sendMessage(msg.chat.id, `❌ Rejected ${userId}`);
-    await bot.sendMessage(Number(userId), "❌ Your registration was rejected by admin.");
   });
-  bot.onText(/\/split/, (msg) => {
+  bot.onText(/\/split/, async (msg) => {
+    if (!(await ensureRegisteredOrAdmin(msg))) return;
     pendingCommandFileActions.set(msg.chat.id, { target: "split" });
     bot.sendMessage(
       msg.chat.id,
       "✂️ Split mode: please send a PDF first. Then I'll ask simple/grouped split and ask for confirmation."
     );
   });
-  bot.onText(/\/compress/, (msg) => bot.sendMessage(msg.chat.id, "🗜️ Compress: Send a PDF and tap “Compressed PDF” or caption: to compress"));
-  bot.onText(/\/ocr/, (msg) => bot.sendMessage(msg.chat.id, "🔎 OCR: Send a scanned PDF and tap “PDF → OCR (Searchable)”. OCR requires ocrmypdf or tesseract installed on server."));
-  bot.onText(/\/translate/, (msg) => {
+  bot.onText(/\/compress/, async (msg) => {
+    if (!(await ensureRegisteredOrAdmin(msg))) return;
+    bot.sendMessage(msg.chat.id, "🗜️ Compress: Send a PDF and tap “Compressed PDF” or caption: to compress");
+  });
+  bot.onText(/\/ocr/, async (msg) => {
+    if (!(await ensureRegisteredOrAdmin(msg))) return;
+    bot.sendMessage(msg.chat.id, "🔎 OCR: Send a scanned PDF and tap “PDF → OCR (Searchable)”. OCR requires ocrmypdf or tesseract installed on server.");
+  });
+  bot.onText(/\/translate/, async (msg) => {
+    if (!(await ensureRegisteredOrAdmin(msg))) return;
     pendingCommandFileActions.set(msg.chat.id, { target: "translate" });
     bot.sendMessage(msg.chat.id, "🌍 Translate mode: send a PDF first. Then send a language code like en, es, fr, de, ar, hi.");
   });
-  bot.onText(/\/scanpdf/, (msg) => {
+  bot.onText(/\/scanpdf/, async (msg) => {
+    if (!(await ensureRegisteredOrAdmin(msg))) return;
     scanToPdfSessions.set(msg.chat.id, { imageFileIds: [], startedAt: Date.now() });
     bot.sendMessage(msg.chat.id, "🖼️ Scan to PDF mode ON.\nSend images one by one.\nWhen finished, type /done\nTo cancel: /cancel");
   });
-  bot.onText(/\/rename/, (msg) => {
+  bot.onText(/\/rename/, async (msg) => {
+    if (!(await ensureRegisteredOrAdmin(msg))) return;
     pendingRenameFileActions.set(msg.chat.id, { active: true });
     bot.sendMessage(msg.chat.id, "✏️ Rename mode: send any file now. I'll ask the new filename and confirm before sending.");
   });
-  bot.onText(/\/protect/, (msg) => {
+  bot.onText(/\/protect/, async (msg) => {
+    if (!(await ensureRegisteredOrAdmin(msg))) return;
     pendingCommandFileActions.set(msg.chat.id, { target: "protect" });
     bot.sendMessage(msg.chat.id, "🔒 Protect mode: Please send a PDF or ZIP file first.");
   });
-  bot.onText(/\/unlock/, (msg) => {
+  bot.onText(/\/unlock/, async (msg) => {
+    if (!(await ensureRegisteredOrAdmin(msg))) return;
     pendingCommandFileActions.set(msg.chat.id, { target: "unlock" });
     bot.sendMessage(msg.chat.id, "🔓 Unlock mode: Please send a PDF or ZIP file first.");
   });
-  bot.onText(/\/watermark/, (msg) => {
+  bot.onText(/\/watermark/, async (msg) => {
+    if (!(await ensureRegisteredOrAdmin(msg))) return;
     pendingCommandFileActions.set(msg.chat.id, { target: "watermark" });
     bot.sendMessage(msg.chat.id, "🖼️ Watermark mode: send a PDF first, then send watermark image (PNG/JPG/JPEG).");
   });
 
-  bot.onText(/\/merge/, (msg) => {
+  bot.onText(/\/merge/, async (msg) => {
+    if (!(await ensureRegisteredOrAdmin(msg))) return;
     mergeSessions.set(msg.chat.id, { fileIds: [], startedAt: Date.now() });
     bot.sendMessage(
       msg.chat.id,
@@ -2406,7 +2475,8 @@ ${lines.join("\n")}` : "No registered users yet.");
     );
   });
 
-  bot.onText(/\/cancel/, (msg) => {
+  bot.onText(/\/cancel/, async (msg) => {
+    if (!(await ensureRegisteredOrAdmin(msg))) return;
     mergeSessions.delete(msg.chat.id);
     scanToPdfSessions.delete(msg.chat.id);
     pendingSplitActions.delete(msg.chat.id);
@@ -2420,6 +2490,7 @@ ${lines.join("\n")}` : "No registered users yet.");
   });
 
   bot.onText(/\/done/, async (msg) => {
+    if (!(await ensureRegisteredOrAdmin(msg))) return;
     const chatId = msg.chat.id;
 
     const scanSession = scanToPdfSessions.get(chatId);
@@ -2969,7 +3040,7 @@ Send more or type /done`);
 
     const reg = await getUserRegistration(query.from || {});
     if (!isAdminUser(query.from) && reg?.status !== "approved" && !data.startsWith("admin:")) {
-      await bot.answerCallbackQuery(query.id, { text: "Account pending approval. Use /start" });
+      await bot.answerCallbackQuery(query.id, { text: "Account pending approval. Use /register" });
       return;
     }
 
@@ -2981,37 +3052,22 @@ Send more or type /done`);
 
       const [, action, userIdRaw] = data.split(":");
       const userId = String(userIdRaw || "");
-      const db = await loadUsersDb();
-      const existing = db.users[userId];
-      if (!existing) {
-        await bot.answerCallbackQuery(query.id, { text: "User not found" });
-        return;
-      }
-
       if (action === "approve") {
-        db.users[userId] = {
-          ...existing,
-          status: "approved",
-          approvedAt: new Date().toISOString(),
-          rejectedAt: null,
-          updatedAt: new Date().toISOString()
-        };
-        await saveUsersDb(db);
-        await bot.answerCallbackQuery(query.id, { text: "User approved" });
-        await bot.sendMessage(Number(userId), "✅ Your account is approved. You can now use converter commands.");
+        const approvedBy = query.from?.username ? `@${query.from.username}` : String(query.from?.id || "admin");
+        const result = await approveUser(userId, approvedBy);
+        await bot.answerCallbackQuery(query.id, { text: result.ok ? "User approved" : result.reason });
+        if (result.ok) {
+          await bot.sendMessage(query.message?.chat?.id, `✅ Approved ${userId}`);
+        }
         return;
       }
 
       if (action === "reject") {
-        db.users[userId] = {
-          ...existing,
-          status: "rejected",
-          rejectedAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        };
-        await saveUsersDb(db);
-        await bot.answerCallbackQuery(query.id, { text: "User rejected" });
-        await bot.sendMessage(Number(userId), "❌ Your registration was rejected by admin.");
+        const result = await rejectUser(userId);
+        await bot.answerCallbackQuery(query.id, { text: result.ok ? "User rejected" : result.reason });
+        if (result.ok) {
+          await bot.sendMessage(query.message?.chat?.id, `❌ Rejected ${userId}`);
+        }
         return;
       }
     }
