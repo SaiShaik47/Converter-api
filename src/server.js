@@ -185,6 +185,61 @@ function commandAvailable(cmd) {
   });
 }
 
+async function detectErrorsAndUpdates() {
+  const errors = [];
+  const warnings = [];
+  const updates = [];
+
+  if (!BOT_TOKEN) {
+    warnings.push("BOT_TOKEN is not set, so Telegram bot features are disabled.");
+  }
+
+  if (!(await commandAvailable("soffice"))) {
+    warnings.push("LibreOffice (soffice) is not installed; office conversions will use fallbacks or fail.");
+  }
+
+  if (!(await commandAvailable("gs"))) {
+    warnings.push("Ghostscript (gs) is not installed; PDF compression quality may be limited.");
+  }
+
+  if (!(await commandAvailable("tesseract"))) {
+    warnings.push("Tesseract is not installed; OCR endpoint will fail.");
+  }
+
+  try {
+    await ensureUsersDbFile();
+  } catch (error) {
+    errors.push(`users db unavailable: ${error.message || error}`);
+  }
+
+  try {
+    const { stdout } = await runCommand("npm", ["outdated", "--json"], { cwd: process.cwd() });
+    const parsed = stdout?.trim() ? JSON.parse(stdout) : {};
+    Object.entries(parsed).forEach(([name, details]) => {
+      updates.push({
+        package: name,
+        current: details.current,
+        wanted: details.wanted,
+        latest: details.latest
+      });
+    });
+  } catch (error) {
+    warnings.push(`Dependency update check unavailable: ${error.message || error}`);
+  }
+
+  return {
+    ok: errors.length === 0,
+    errors,
+    warnings,
+    updates,
+    counts: {
+      errors: errors.length,
+      warnings: warnings.length,
+      updates: updates.length
+    }
+  };
+}
+
 async function downloadTelegramFile(bot, fileId, workDir, options = {}) {
   const file = await bot.getFile(fileId);
   const filePath = file?.file_path;
@@ -1100,10 +1155,17 @@ app.get("/", (req, res) => {
       pdf_ocr: "POST /pdf-ocr (form-data key: file)",
       scan_to_pdf: "POST /scan-to-pdf (form-data key: files[])",
       pdf_translate: "POST /pdf-translate?lang=es (form-data key: file)",
+      diagnostics: "GET /diagnostics (detect runtime errors and dependency updates)",
       available_translate_languages: TRANSLATION_LANGUAGES
     },
     limits: { max_upload_mb: MAX_MB }
   });
+});
+
+
+app.get("/diagnostics", async (req, res) => {
+  const report = await detectErrorsAndUpdates();
+  res.status(report.ok ? 200 : 503).json(report);
 });
 
 async function handleFileConversion(req, res, options) {
