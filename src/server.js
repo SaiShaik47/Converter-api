@@ -662,9 +662,16 @@ function drawTiledTextWatermark(page, text, font, textWidth, fontSize, angles = 
   }
 }
 
-function drawTextWatermarkOnPage(page, text, font, preset = "diag_rl") {
+function resolveWatermarkFontScale(sizePreset = "medium") {
+  if (sizePreset === "small") return 0.75;
+  if (sizePreset === "large") return 1.25;
+  return 1;
+}
+
+function drawTextWatermarkOnPage(page, text, font, preset = "diag_rl", sizePreset = "medium") {
   const { width } = page.getSize();
-  const fontSize = Math.max(Math.round(width * 0.065), 18);
+  const scale = resolveWatermarkFontScale(sizePreset);
+  const fontSize = Math.max(Math.round(width * 0.065 * scale), 14);
   const textWidth = font.widthOfTextAtSize(text, fontSize);
   const textHeight = fontSize;
 
@@ -708,20 +715,20 @@ function drawTextWatermarkOnPage(page, text, font, preset = "diag_rl") {
   }
 }
 
-async function addTextWatermarkToPdf(inputPdfPath, outputPdfPath, text, preset = "diag_rl") {
+async function addTextWatermarkToPdf(inputPdfPath, outputPdfPath, text, preset = "diag_rl", sizePreset = "medium") {
   const srcBytes = await fs.readFile(inputPdfPath);
   const pdfDoc = await PDFDocument.load(srcBytes, { ignoreEncryption: true });
   const font = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
 
   const pages = pdfDoc.getPages();
   for (const page of pages) {
-    drawTextWatermarkOnPage(page, text, font, preset);
+    drawTextWatermarkOnPage(page, text, font, preset, sizePreset);
   }
 
   await fs.writeFile(outputPdfPath, await pdfDoc.save());
 }
 
-async function addTextImageWatermarkToPdf(inputPdfPath, watermarkImagePath, outputPdfPath, text, preset = "diag_rl") {
+async function addTextImageWatermarkToPdf(inputPdfPath, watermarkImagePath, outputPdfPath, text, preset = "diag_rl", sizePreset = "medium") {
   const srcBytes = await fs.readFile(inputPdfPath);
   const wmBytes = await fs.readFile(watermarkImagePath);
   const pdfDoc = await PDFDocument.load(srcBytes, { ignoreEncryption: true });
@@ -733,7 +740,7 @@ async function addTextImageWatermarkToPdf(inputPdfPath, watermarkImagePath, outp
     : await pdfDoc.embedPng(wmBytes);
 
   for (const page of pdfDoc.getPages()) {
-    drawTextWatermarkOnPage(page, text, font, preset);
+    drawTextWatermarkOnPage(page, text, font, preset, sizePreset);
 
     const { width, height } = page.getSize();
     const baseW = Math.max(width * 0.25, 100);
@@ -1297,7 +1304,7 @@ app.get("/", (req, res) => {
       pdf_to_pptx: "POST /pdf-to-pptx (form-data key: file)",
       html_to_pdf: "POST /html-to-pdf (form-data key: file)",
       pdf_to_html: "POST /pdf-to-html (form-data key: file)",
-      pdf_watermark: "POST /pdf-watermark (form-data keys: file, watermark[optional], text[optional], preset[optional], mode=image|text|combo)",
+      pdf_watermark: "POST /pdf-watermark (form-data keys: file, watermark[optional], text[optional], preset[optional], size=small|medium|large[optional], mode=image|text|combo)",
       csv_to_xlsx: "POST /csv-to-xlsx (form-data key: file)",
       xlsx_to_csv: "POST /xlsx-to-csv (form-data key: file)",
       csv_to_json: "POST /csv-to-json (form-data key: file)",
@@ -1511,6 +1518,7 @@ app.post("/pdf-watermark", upload.fields([{ name: "file", maxCount: 1 }, { name:
   const mode = (req.body?.mode || "image").toLowerCase();
   const text = (req.body?.text || "").toString().trim();
   const preset = (req.body?.preset || "diag_rl").toString();
+  const size = (req.body?.size || "medium").toString().toLowerCase();
 
   if (!fileInput) {
     if (watermarkInput) await safeUnlink(watermarkInput);
@@ -1543,12 +1551,18 @@ app.post("/pdf-watermark", upload.fields([{ name: "file", maxCount: 1 }, { name:
     return res.status(400).json({ ok: false, error: "For text/combo mode, text must be 2-80 chars in field:text" });
   }
 
+  if (!["small", "medium", "large"].includes(size)) {
+    await safeUnlink(fileInput);
+    if (watermarkInput) await safeUnlink(watermarkInput);
+    return res.status(400).json({ ok: false, error: "Invalid size. Use small, medium, or large." });
+  }
+
   const outPath = path.join(os.tmpdir(), randName(".pdf"));
   try {
     if (mode === "text") {
-      await addTextWatermarkToPdf(fileInput, outPath, text, preset);
+      await addTextWatermarkToPdf(fileInput, outPath, text, preset, size);
     } else if (mode === "combo") {
-      await addTextImageWatermarkToPdf(fileInput, watermarkInput, outPath, text, preset);
+      await addTextImageWatermarkToPdf(fileInput, watermarkInput, outPath, text, preset, size);
     } else {
       await addImageWatermarkToPdf(fileInput, watermarkInput, outPath);
     }
@@ -2115,7 +2129,7 @@ You’ll get smart buttons for every supported tool.
 • Send 2+ PDFs together with caption: merge
 • Tap Protect/Unlock → send password when asked
 • Scan mode: /scanpdf → send images → /done
-• Watermark mode: /watermark → send PDF → choose image/text/combo mode
+• Watermark mode: /watermark → send PDF → choose image/text/combo mode, text size, and style
 
 📦 *Limits:*
 • Max file size: ${MAX_MB} MB
@@ -2285,9 +2299,9 @@ Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "
       watermark: { label: "PDF → Watermark", outputExt: ".pdf", needsWatermark: true, convert: async (input, dir, context = {}) => {
         const outPath = path.join(dir, "watermarked.pdf");
         if (context.watermarkMode === "text") {
-          await addTextWatermarkToPdf(input, outPath, context.watermarkText, context.watermarkPreset);
+          await addTextWatermarkToPdf(input, outPath, context.watermarkText, context.watermarkPreset, context.watermarkSize);
         } else if (context.watermarkMode === "combo") {
-          await addTextImageWatermarkToPdf(input, context.watermarkPath, outPath, context.watermarkText, context.watermarkPreset);
+          await addTextImageWatermarkToPdf(input, context.watermarkPath, outPath, context.watermarkText, context.watermarkPreset, context.watermarkSize);
         } else {
           await addImageWatermarkToPdf(input, context.watermarkPath, outPath);
         }
@@ -2417,7 +2431,7 @@ Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "
   const pendingSplitActions = new Map(); // chatId -> { fileId, ext, mode, pagesInput, stage }
   const pendingRenameActions = new Map(); // chatId -> { outputPath, conversionLabel, outputExt, requestedBaseName, stage, showPdfToXlsxTip }
   const pendingRenameFileActions = new Map(); // chatId -> { active: true }
-  const pendingWatermarkActions = new Map(); // chatId -> { conversion, fileId, ext, target, stage, mode, text, preset }
+  const pendingWatermarkActions = new Map(); // chatId -> { conversion, fileId, ext, target, stage, mode, text, preset, size }
 
   // ✅ Step-by-step merge mode
   const mergeSessions = new Map(); // chatId -> { fileIds: [], startedAt: Date.now() }
@@ -2514,6 +2528,16 @@ Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "
     };
   }
 
+  function buildWatermarkSizeKeyboard() {
+    return {
+      inline_keyboard: [[
+        { text: "🔡 Small", callback_data: "wmsize:small" },
+        { text: "🔠 Medium", callback_data: "wmsize:medium" },
+        { text: "🅰️ Large", callback_data: "wmsize:large" }
+      ]]
+    };
+  }
+
   function sanitizeOutputBaseName(input) {
     if (!input) return "";
     return input
@@ -2523,6 +2547,45 @@ Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "
       .replace(/-+/g, "-")
       .replace(/^[-.]+|[-.]+$/g, "")
       .slice(0, 80);
+  }
+
+  async function queueRenameAndConfirm(chatId, {
+    outputPath,
+    conversionLabel,
+    outputExt,
+    defaultBaseName,
+    contentType,
+    showPdfToXlsxTip = false,
+    promptText
+  }) {
+    const renamePrompt = await bot.sendMessage(
+      chatId,
+      promptText || `✅ *${conversionLabel}* done.\nSend the output filename (without extension) to rename this file to *.${outputExt.replace(".", "")}*.`,
+      { parse_mode: "Markdown" }
+    );
+
+    const timer = setTimeout(async () => {
+      const autoSent = await flushRenameOutput(chatId, defaultBaseName);
+      if (autoSent) {
+        await bot.sendMessage(chatId, `⏱️ No name received in time. Sent with default name: ${defaultBaseName}${outputExt}`);
+      }
+    }, 90 * 1000);
+
+    const existingRename = pendingRenameActions.get(chatId);
+    if (existingRename?.timer) clearTimeout(existingRename.timer);
+    if (existingRename?.outputPath) await safeUnlink(existingRename.outputPath);
+
+    pendingRenameActions.set(chatId, {
+      outputPath,
+      conversionLabel,
+      outputExt,
+      requestedBaseName: defaultBaseName,
+      stage: "awaiting_name",
+      messageId: renamePrompt.message_id,
+      timer,
+      contentType,
+      showPdfToXlsxTip
+    });
   }
 
   async function flushRenameOutput(chatId, customBaseName = "") {
@@ -2758,7 +2821,7 @@ ${lines.join("\n")}` : "No registered users yet.");
   bot.onText(/\/watermark/, async (msg) => {
     if (!(await ensureRegisteredOrAdmin(msg))) return;
     pendingCommandFileActions.set(msg.chat.id, { target: "watermark" });
-    bot.sendMessage(msg.chat.id, "🖼️ Watermark mode: send a PDF first. Then choose image, text, or text+image watermark mode.");
+    bot.sendMessage(msg.chat.id, "🖼️ Watermark mode: send a PDF first. Then choose image, text, or text+image watermark mode with size/style options.");
   });
 
   bot.onText(/\/merge/, async (msg) => {
@@ -2941,31 +3004,11 @@ ${lines.join("\n")}` : "No registered users yet.");
         path.basename(convertedPath, path.extname(convertedPath)) || `${resolvedTarget || "converted"}-file`
       ) || `${resolvedTarget || "converted"}-file`;
 
-      const renamePrompt = await bot.sendMessage(
-        chatId,
-        `✅ *${conversion.label}* done.\nSend the output filename (without extension) to rename this file to *.${conversion.outputExt.replace(".", "")}*.`,
-        { parse_mode: "Markdown" }
-      );
-
-      const timer = setTimeout(async () => {
-        const autoSent = await flushRenameOutput(chatId, defaultBaseName);
-        if (autoSent) {
-          await bot.sendMessage(chatId, `⏱️ No name received in time. Sent with default name: ${defaultBaseName}${conversion.outputExt}`);
-        }
-      }, 90 * 1000);
-
-      const existingRename = pendingRenameActions.get(chatId);
-      if (existingRename?.timer) clearTimeout(existingRename.timer);
-      if (existingRename?.outputPath) await safeUnlink(existingRename.outputPath);
-
-      pendingRenameActions.set(chatId, {
+      await queueRenameAndConfirm(chatId, {
         outputPath,
         conversionLabel: conversion.label,
         outputExt: conversion.outputExt,
-        requestedBaseName: defaultBaseName,
-        stage: "awaiting_name",
-        messageId: renamePrompt.message_id,
-        timer,
+        defaultBaseName,
         contentType: conversion.contentType,
         showPdfToXlsxTip: resolvedTarget === "xlsx" && ext === ".pdf"
       });
@@ -2981,14 +3024,14 @@ ${lines.join("\n")}` : "No registered users yet.");
   }
 
 
-  async function performWatermarkConversion({ chatId, conversion, fileId, ext, watermarkFileId, watermarkExt, watermarkMode = "image", watermarkText = "", watermarkPreset = "diag_rl" }) {
+  async function performWatermarkConversion({ chatId, conversion, fileId, ext, watermarkFileId, watermarkExt, watermarkMode = "image", watermarkText = "", watermarkPreset = "diag_rl", watermarkSize = "medium" }) {
     const status = await bot.sendMessage(chatId, "⏳ *Applying watermark*\nDownloading files...", { parse_mode: "Markdown" });
     const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "tg-wm-"));
     let outputPath = path.join(os.tmpdir(), randName(conversion.outputExt));
 
     try {
       const sourcePath = await downloadTelegramFile(bot, fileId, workDir, { preferredExt: ext });
-      const context = { watermarkMode, watermarkText, watermarkPreset };
+      const context = { watermarkMode, watermarkText, watermarkPreset, watermarkSize };
 
       if (["image", "combo"].includes(watermarkMode)) {
         context.watermarkPath = await downloadTelegramFile(bot, watermarkFileId, workDir, { preferredExt: watermarkExt });
@@ -3002,7 +3045,22 @@ ${lines.join("\n")}` : "No registered users yet.");
 
       const convertedPath = await conversion.convert(sourcePath, workDir, context);
       await fs.copyFile(convertedPath, outputPath);
-      await bot.sendDocument(chatId, outputPath, { caption: "✅ PDF watermark added" });
+
+      await bot.editMessageText("✅ *Watermark ready*\nChoose output filename.", {
+        chat_id: chatId,
+        message_id: status.message_id,
+        parse_mode: "Markdown"
+      });
+
+      await queueRenameAndConfirm(chatId, {
+        outputPath,
+        conversionLabel: "PDF watermark",
+        outputExt: conversion.outputExt || ".pdf",
+        defaultBaseName: "watermarked",
+        contentType: conversion.contentType || "application/pdf",
+        promptText: "✅ *PDF watermark added*\nSend the output filename (without extension), then confirm before I send it."
+      });
+      outputPath = "";
     } catch (e) {
       await bot.sendMessage(chatId, `❌ Watermark failed.\nReason: ${e.message}`);
     } finally {
@@ -3050,7 +3108,8 @@ Send more or type /done`);
         watermarkExt: ".jpg",
         watermarkMode: pendingWm.mode || "image",
         watermarkText: pendingWm.text || "",
-        watermarkPreset: pendingWm.preset || "diag_rl"
+        watermarkPreset: pendingWm.preset || "diag_rl",
+        watermarkSize: pendingWm.size || "medium"
       });
       return;
     }
@@ -3124,7 +3183,8 @@ Send more or type /done`);
         watermarkExt: ext,
         watermarkMode: pendingWm.mode || "image",
         watermarkText: pendingWm.text || "",
-        watermarkPreset: pendingWm.preset || "diag_rl"
+        watermarkPreset: pendingWm.preset || "diag_rl",
+        watermarkSize: pendingWm.size || "medium"
       });
       return;
     }
@@ -3209,33 +3269,14 @@ Send more or type /done`);
 
         const defaultBaseName = sanitizeOutputBaseName(path.basename(fileName, path.extname(fileName)) || "renamed-file") || "renamed-file";
 
-        const renamePrompt = await bot.sendMessage(
-          chatId,
-          `📎 File received: *${fileName}*\nSend the new filename without extension. I will keep ${outputExt}.`,
-          { parse_mode: "Markdown" }
-        );
-
-        const existingRename = pendingRenameActions.get(chatId);
-        if (existingRename?.timer) clearTimeout(existingRename.timer);
-        if (existingRename?.outputPath) await safeUnlink(existingRename.outputPath);
-
-        const timer = setTimeout(async () => {
-          const autoSent = await flushRenameOutput(chatId, defaultBaseName);
-          if (autoSent) {
-            await bot.sendMessage(chatId, `⏱️ No name received in time. Sent with default name: ${defaultBaseName}${outputExt}`);
-          }
-        }, 90 * 1000);
-
-        pendingRenameActions.set(chatId, {
+        await queueRenameAndConfirm(chatId, {
           outputPath,
           conversionLabel: "Renamed file",
           outputExt,
-          requestedBaseName: defaultBaseName,
-          stage: "awaiting_name",
-          messageId: renamePrompt.message_id,
-          timer,
+          defaultBaseName,
           contentType: doc.mime_type || "application/octet-stream",
-          showPdfToXlsxTip: false
+          showPdfToXlsxTip: false,
+          promptText: `📎 File received: *${fileName}*\nSend the new filename without extension. I will keep ${outputExt}.`
         });
 
         outputPath = "";
@@ -3362,7 +3403,7 @@ Send more or type /done`);
       return;
     }
 
-    if (data.startsWith("wmmode:") || data.startsWith("wmpos:")) {
+    if (data.startsWith("wmmode:") || data.startsWith("wmsize:") || data.startsWith("wmpos:")) {
       const chatId = query.message?.chat?.id;
       if (!chatId) {
         await bot.answerCallbackQuery(query.id, { text: "Watermark session expired." });
@@ -3392,6 +3433,7 @@ Send more or type /done`);
         }
 
         pendingWm.mode = mode;
+        pendingWm.size = "medium";
         pendingWm.stage = "awaiting_text";
         pendingWatermarkActions.set(chatId, pendingWm);
         await bot.answerCallbackQuery(query.id, { text: "Send watermark text" });
@@ -3402,6 +3444,26 @@ Send more or type /done`);
         return;
       }
 
+      if (data.startsWith("wmsize:")) {
+        const size = data.split(":")[1];
+        if (!size || !["small", "medium", "large"].includes(size)) {
+          await bot.answerCallbackQuery(query.id, { text: "Invalid watermark size." });
+          return;
+        }
+
+        if (pendingWm.stage !== "choose_size") {
+          await bot.answerCallbackQuery(query.id, { text: "Set watermark text first." });
+          return;
+        }
+
+        pendingWm.size = size;
+        pendingWm.stage = "choose_preset";
+        pendingWatermarkActions.set(chatId, pendingWm);
+        await bot.answerCallbackQuery(query.id, { text: `Size set: ${size}` });
+        await bot.sendMessage(chatId, "Now choose text watermark style and position:", { reply_markup: buildWatermarkPresetKeyboard() });
+        return;
+      }
+
       const preset = data.split(":")[1];
       if (!preset || !["diag_rl", "diag_lr", "cross", "center", "top_left", "tile_rl", "tile_lr", "tile_cross"].includes(preset)) {
         await bot.answerCallbackQuery(query.id, { text: "Invalid watermark position." });
@@ -3409,7 +3471,7 @@ Send more or type /done`);
       }
 
       if (pendingWm.stage !== "choose_preset") {
-        await bot.answerCallbackQuery(query.id, { text: "Set watermark text first." });
+        await bot.answerCallbackQuery(query.id, { text: "Choose watermark size first." });
         return;
       }
 
@@ -3431,7 +3493,8 @@ Send more or type /done`);
         ext: pendingWm.ext,
         watermarkMode: "text",
         watermarkText: pendingWm.text,
-        watermarkPreset: preset
+        watermarkPreset: preset,
+        watermarkSize: pendingWm.size || "medium"
       });
       return;
     }
@@ -3729,12 +3792,12 @@ Send more or type /done`);
       }
 
       pendingWm.text = text;
-      pendingWm.stage = "choose_preset";
+      pendingWm.stage = "choose_size";
       pendingWatermarkActions.set(chatId, pendingWm);
       await bot.sendMessage(
         chatId,
-        "Choose text watermark style and position\n• Diagonal right→left / left→right\n• Full-page repeat (institution style)\n• Cross\n• Center\n• Top-left straight",
-        { reply_markup: buildWatermarkPresetKeyboard() }
+        "Choose watermark text size first:",
+        { reply_markup: buildWatermarkSizeKeyboard() }
       );
       await bot.sendMessage(chatId, "Suggestions: use short text like CONFIDENTIAL, DRAFT, INTERNAL, or your brand name.");
       return;
