@@ -11,7 +11,7 @@ import XLSX from "xlsx";
 import TelegramBot from "node-telegram-bot-api";
 import pdfParse from "pdf-parse";
 import PDFKitDocument from "pdfkit";
-import { PDFDocument } from "pdf-lib";
+import { PDFDocument, StandardFonts, degrees, rgb } from "pdf-lib";
 import https from "https";
 import archiver from "archiver";
 import { Document, Packer, Paragraph } from "docx";
@@ -586,6 +586,85 @@ async function addImageWatermarkToPdf(inputPdfPath, watermarkImagePath, outputPd
       height: wmH,
       opacity: 0.25
     });
+  }
+
+  await fs.writeFile(outputPdfPath, await pdfDoc.save());
+}
+
+function resolveTextWatermarkPlacement(preset, page, textWidth, textHeight) {
+  const { width, height } = page.getSize();
+  const margin = Math.max(Math.min(width, height) * 0.05, 24);
+
+  if (preset === "center") {
+    return {
+      x: (width - textWidth) / 2,
+      y: (height - textHeight) / 2,
+      rotate: degrees(0),
+      second: null
+    };
+  }
+
+  if (preset === "top_left") {
+    return {
+      x: margin,
+      y: height - margin - textHeight,
+      rotate: degrees(0),
+      second: null
+    };
+  }
+
+  if (preset === "cross") {
+    return {
+      x: (width - textWidth) / 2,
+      y: (height - textHeight) / 2,
+      rotate: degrees(45),
+      second: { rotate: degrees(-45) }
+    };
+  }
+
+  return {
+    // right to left diagonal
+    x: (width - textWidth) / 2,
+    y: (height - textHeight) / 2,
+    rotate: degrees(-45),
+    second: null
+  };
+}
+
+async function addTextWatermarkToPdf(inputPdfPath, outputPdfPath, text, preset = "diag_rl") {
+  const srcBytes = await fs.readFile(inputPdfPath);
+  const pdfDoc = await PDFDocument.load(srcBytes, { ignoreEncryption: true });
+  const font = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+  const pages = pdfDoc.getPages();
+  for (const page of pages) {
+    const { width } = page.getSize();
+    const fontSize = Math.max(Math.round(width * 0.065), 18);
+    const textWidth = font.widthOfTextAtSize(text, fontSize);
+    const textHeight = fontSize;
+    const placement = resolveTextWatermarkPlacement(preset, page, textWidth, textHeight);
+
+    page.drawText(text, {
+      x: placement.x,
+      y: placement.y,
+      size: fontSize,
+      font,
+      color: rgb(0.45, 0.45, 0.45),
+      rotate: placement.rotate,
+      opacity: 0.28
+    });
+
+    if (placement.second) {
+      page.drawText(text, {
+        x: placement.x,
+        y: placement.y,
+        size: fontSize,
+        font,
+        color: rgb(0.45, 0.45, 0.45),
+        rotate: placement.second.rotate,
+        opacity: 0.2
+      });
+    }
   }
 
   await fs.writeFile(outputPdfPath, await pdfDoc.save());
@@ -1925,7 +2004,7 @@ You’ll get smart buttons for every supported tool.
 • Send 2+ PDFs together with caption: merge
 • Tap Protect/Unlock → send password when asked
 • Scan mode: /scanpdf → send images → /done
-• Watermark mode: /watermark → send PDF → send watermark image
+• Watermark mode: /watermark → send PDF → choose image/text mode
 
 📦 *Limits:*
 • Max file size: ${MAX_MB} MB
@@ -2094,7 +2173,11 @@ Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "
       html: { label: "PDF → HTML", outputExt: ".html", convert: (input, dir) => libreOfficeConvert(input, dir, "html") },
       watermark: { label: "PDF → Watermark", outputExt: ".pdf", needsWatermark: true, convert: async (input, dir, context = {}) => {
         const outPath = path.join(dir, "watermarked.pdf");
-        await addImageWatermarkToPdf(input, context.watermarkPath, outPath);
+        if (context.watermarkMode === "text") {
+          await addTextWatermarkToPdf(input, outPath, context.watermarkText, context.watermarkPreset);
+        } else {
+          await addImageWatermarkToPdf(input, context.watermarkPath, outPath);
+        }
         return outPath;
       }},
       images: { label: "PDF → Images (ZIP)", outputExt: ".zip", convert: async (input, dir) => {
@@ -2221,7 +2304,7 @@ Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "
   const pendingSplitActions = new Map(); // chatId -> { fileId, ext, mode, pagesInput, stage }
   const pendingRenameActions = new Map(); // chatId -> { outputPath, conversionLabel, outputExt, requestedBaseName, stage, showPdfToXlsxTip }
   const pendingRenameFileActions = new Map(); // chatId -> { active: true }
-  const pendingWatermarkActions = new Map(); // chatId -> { conversion, fileId, ext, target }
+  const pendingWatermarkActions = new Map(); // chatId -> { conversion, fileId, ext, target, stage, mode, text, preset }
 
   // ✅ Step-by-step merge mode
   const mergeSessions = new Map(); // chatId -> { fileIds: [], startedAt: Date.now() }
@@ -2282,6 +2365,30 @@ Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "
         { text: "✅ Confirm", callback_data: "renameconfirm:yes" },
         { text: "✏️ Change name", callback_data: "renameconfirm:no" }
       ]]
+    };
+  }
+
+  function buildWatermarkModeKeyboard() {
+    return {
+      inline_keyboard: [[
+        { text: "🖼️ Image watermark", callback_data: "wmmode:image" },
+        { text: "🔤 Text watermark", callback_data: "wmmode:text" }
+      ]]
+    };
+  }
+
+  function buildWatermarkPresetKeyboard() {
+    return {
+      inline_keyboard: [
+        [
+          { text: "↘️ Diagonal (right→left)", callback_data: "wmpos:diag_rl" },
+          { text: "✖️ Cross", callback_data: "wmpos:cross" }
+        ],
+        [
+          { text: "🎯 Center", callback_data: "wmpos:center" },
+          { text: "↖️ Top-left straight", callback_data: "wmpos:top_left" }
+        ]
+      ]
     };
   }
 
@@ -2357,7 +2464,7 @@ Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "
 Quick usage:
 • Send any file and pick button
 • Or use caption: to pdf / to docx / to pptx / to html
-• For watermark: use /watermark then send PDF, then watermark image
+• For watermark: use /watermark then send PDF, choose image or text mode
 
 Limit: ${MAX_MB} MB`;
 
@@ -2375,7 +2482,7 @@ Limit: ${MAX_MB} MB`;
 /ocr - OCR scanned PDF
 /translate - translate PDF language
 /scanpdf - merge images into one PDF
-/watermark - apply watermark image to PDF
+/watermark - apply image or text watermark to PDF
 /rename - rename any file
 /protect - protect PDF/ZIP with password
 /unlock - unlock PDF/ZIP with password
@@ -2411,7 +2518,7 @@ Use /users to view details.`;
     { command: "ocr", description: "OCR a scanned PDF" },
     { command: "translate", description: "Translate a PDF" },
     { command: "scanpdf", description: "Build one PDF from images" },
-    { command: "watermark", description: "Apply image watermark to PDF" },
+    { command: "watermark", description: "Apply image/text watermark to PDF" },
     { command: "rename", description: "Rename any file and resend it" },
     { command: "protect", description: "Password-protect a PDF/ZIP" },
     { command: "unlock", description: "Unlock a PDF/ZIP" },
@@ -2529,7 +2636,7 @@ ${lines.join("\n")}` : "No registered users yet.");
   bot.onText(/\/watermark/, async (msg) => {
     if (!(await ensureRegisteredOrAdmin(msg))) return;
     pendingCommandFileActions.set(msg.chat.id, { target: "watermark" });
-    bot.sendMessage(msg.chat.id, "🖼️ Watermark mode: send a PDF first, then send watermark image (PNG/JPG/JPEG).");
+    bot.sendMessage(msg.chat.id, "🖼️ Watermark mode: send a PDF first. Then choose image or text watermark mode.");
   });
 
   bot.onText(/\/merge/, async (msg) => {
@@ -2752,14 +2859,18 @@ ${lines.join("\n")}` : "No registered users yet.");
   }
 
 
-  async function performWatermarkConversion({ chatId, conversion, fileId, ext, watermarkFileId, watermarkExt }) {
+  async function performWatermarkConversion({ chatId, conversion, fileId, ext, watermarkFileId, watermarkExt, watermarkMode = "image", watermarkText = "", watermarkPreset = "diag_rl" }) {
     const status = await bot.sendMessage(chatId, "⏳ *Applying watermark*\nDownloading files...", { parse_mode: "Markdown" });
     const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "tg-wm-"));
     let outputPath = path.join(os.tmpdir(), randName(conversion.outputExt));
 
     try {
       const sourcePath = await downloadTelegramFile(bot, fileId, workDir, { preferredExt: ext });
-      const watermarkPath = await downloadTelegramFile(bot, watermarkFileId, workDir, { preferredExt: watermarkExt });
+      const context = { watermarkMode, watermarkText, watermarkPreset };
+
+      if (watermarkMode === "image") {
+        context.watermarkPath = await downloadTelegramFile(bot, watermarkFileId, workDir, { preferredExt: watermarkExt });
+      }
 
       await bot.editMessageText("⚙️ *Applying watermark*\nPlease wait...", {
         chat_id: chatId,
@@ -2767,7 +2878,7 @@ ${lines.join("\n")}` : "No registered users yet.");
         parse_mode: "Markdown"
       });
 
-      const convertedPath = await conversion.convert(sourcePath, workDir, { watermarkPath });
+      const convertedPath = await conversion.convert(sourcePath, workDir, context);
       await fs.copyFile(convertedPath, outputPath);
       await bot.sendDocument(chatId, outputPath, { caption: "✅ PDF watermark added" });
     } catch (e) {
@@ -2802,6 +2913,11 @@ Send more or type /done`);
 
     const pendingWm = pendingWatermarkActions.get(chatId);
     if (pendingWm) {
+      if (pendingWm.stage !== "awaiting_image") {
+        await bot.sendMessage(chatId, "Please finish watermark setup first using the buttons.");
+        return;
+      }
+
       pendingWatermarkActions.delete(chatId);
       await performWatermarkConversion({
         chatId,
@@ -2809,7 +2925,9 @@ Send more or type /done`);
         fileId: pendingWm.fileId,
         ext: pendingWm.ext,
         watermarkFileId: best.file_id,
-        watermarkExt: ".jpg"
+        watermarkExt: ".jpg",
+        watermarkMode: "image",
+        watermarkPreset: pendingWm.preset || "diag_rl"
       });
       return;
     }
@@ -2867,6 +2985,9 @@ Send more or type /done`);
 
     const pendingWm = pendingWatermarkActions.get(chatId);
     if (pendingWm) {
+      if (pendingWm.stage !== "awaiting_image") {
+        return bot.sendMessage(chatId, "Please finish watermark setup first using the buttons.");
+      }
       if (!scanImageExts.includes(ext)) {
         return bot.sendMessage(chatId, "❌ Watermark must be an image file (PNG/JPG/JPEG). Send image again.");
       }
@@ -2877,7 +2998,9 @@ Send more or type /done`);
         fileId: pendingWm.fileId,
         ext: pendingWm.ext,
         watermarkFileId: doc.file_id,
-        watermarkExt: ext
+        watermarkExt: ext,
+        watermarkMode: "image",
+        watermarkPreset: pendingWm.preset || "diag_rl"
       });
       return;
     }
@@ -2930,9 +3053,10 @@ Send more or type /done`);
           conversion,
           fileId: doc.file_id,
           ext,
-          target: pendingFileAction.target
+          target: pendingFileAction.target,
+          stage: "choose_mode"
         });
-        return bot.sendMessage(chatId, "🖼️ Now send watermark image (PNG/JPG/JPEG).");
+        return bot.sendMessage(chatId, "Choose watermark mode:", { reply_markup: buildWatermarkModeKeyboard() });
       }
 
       await performConversion({
@@ -3086,9 +3210,10 @@ Send more or type /done`);
         conversion,
         fileId: doc.file_id,
         ext,
-        target
+        target,
+        stage: "choose_mode"
       });
-      return bot.sendMessage(chatId, "🖼️ Send watermark image (PNG/JPG/JPEG).");
+      return bot.sendMessage(chatId, "Choose watermark mode:", { reply_markup: buildWatermarkModeKeyboard() });
     }
 
     await performConversion({
@@ -3110,6 +3235,68 @@ Send more or type /done`);
         ? "Account pending approval"
         : "Use /register first";
       await bot.answerCallbackQuery(query.id, { text: message });
+      return;
+    }
+
+    if (data.startsWith("wmmode:") || data.startsWith("wmpos:")) {
+      const chatId = query.message?.chat?.id;
+      if (!chatId) {
+        await bot.answerCallbackQuery(query.id, { text: "Watermark session expired." });
+        return;
+      }
+
+      const pendingWm = pendingWatermarkActions.get(chatId);
+      if (!pendingWm) {
+        await bot.answerCallbackQuery(query.id, { text: "Watermark session expired." });
+        return;
+      }
+
+      if (data.startsWith("wmmode:")) {
+        const mode = data.split(":")[1];
+        if (!mode || !["image", "text"].includes(mode)) {
+          await bot.answerCallbackQuery(query.id, { text: "Invalid mode." });
+          return;
+        }
+
+        if (mode === "image") {
+          pendingWm.mode = "image";
+          pendingWm.stage = "awaiting_image";
+          pendingWatermarkActions.set(chatId, pendingWm);
+          await bot.answerCallbackQuery(query.id, { text: "Send watermark image" });
+          await bot.sendMessage(chatId, "🖼️ Send watermark image (PNG/JPG/JPEG).");
+          return;
+        }
+
+        pendingWm.mode = "text";
+        pendingWm.stage = "awaiting_text";
+        pendingWatermarkActions.set(chatId, pendingWm);
+        await bot.answerCallbackQuery(query.id, { text: "Send watermark text" });
+        await bot.sendMessage(chatId, "🔤 Send watermark text (for example: Confidential / Draft / Your Brand).");
+        return;
+      }
+
+      const preset = data.split(":")[1];
+      if (!preset || !["diag_rl", "cross", "center", "top_left"].includes(preset)) {
+        await bot.answerCallbackQuery(query.id, { text: "Invalid watermark position." });
+        return;
+      }
+
+      if (pendingWm.stage !== "choose_preset") {
+        await bot.answerCallbackQuery(query.id, { text: "Set watermark text first." });
+        return;
+      }
+
+      pendingWatermarkActions.delete(chatId);
+      await bot.answerCallbackQuery(query.id, { text: "Applying watermark..." });
+      await performWatermarkConversion({
+        chatId,
+        conversion: pendingWm.conversion,
+        fileId: pendingWm.fileId,
+        ext: pendingWm.ext,
+        watermarkMode: "text",
+        watermarkText: pendingWm.text,
+        watermarkPreset: preset
+      });
       return;
     }
 
@@ -3309,10 +3496,11 @@ Send more or type /done`);
         conversion,
         fileId: pending.fileId,
         ext: pending.ext,
-        target
+        target,
+        stage: "choose_mode"
       });
-      await bot.answerCallbackQuery(query.id, { text: "Send watermark image" });
-      await bot.sendMessage(pending.chatId, "🖼️ Send watermark image (PNG/JPG/JPEG).");
+      await bot.answerCallbackQuery(query.id, { text: "Choose watermark mode" });
+      await bot.sendMessage(pending.chatId, "Choose watermark mode:", { reply_markup: buildWatermarkModeKeyboard() });
       return;
     }
 
@@ -3394,6 +3582,25 @@ Send more or type /done`);
         `Confirm split with: ${normalized} ?`,
         { reply_markup: buildSplitConfirmKeyboard() }
       );
+      return;
+    }
+
+    const pendingWm = pendingWatermarkActions.get(chatId);
+    if (pendingWm?.stage === "awaiting_text") {
+      if (text.length < 2 || text.length > 80) {
+        await bot.sendMessage(chatId, "❌ Watermark text must be 2-80 characters.");
+        return;
+      }
+
+      pendingWm.text = text;
+      pendingWm.stage = "choose_preset";
+      pendingWatermarkActions.set(chatId, pendingWm);
+      await bot.sendMessage(
+        chatId,
+        "Choose text watermark style and position\n• Diagonal right→left\n• Cross\n• Center\n• Top-left straight",
+        { reply_markup: buildWatermarkPresetKeyboard() }
+      );
+      await bot.sendMessage(chatId, "Suggestions: use short text like CONFIDENTIAL, DRAFT, INTERNAL, or your brand name.");
       return;
     }
 
