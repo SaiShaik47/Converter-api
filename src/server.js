@@ -30,13 +30,19 @@ const BOT_TOKEN = process.env.BOT_TOKEN || "";
 const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID || "-1003575783554";
 const LOG_CHANNEL_USERNAME = process.env.LOG_CHANNEL_USERNAME || "@OsintLogsUpdates";
 
-const MAX_MB = 25;
+const DEFAULT_MAX_MB = 25;
+const MAX_FILE_MB_CAP = 2048;
+
+function resolveLimitMb(rawValue, fallbackMb, capMb = MAX_FILE_MB_CAP) {
+  const parsed = Number(rawValue ?? fallbackMb);
+  if (!Number.isFinite(parsed)) return fallbackMb;
+  return Math.max(1, Math.min(capMb, Math.floor(parsed)));
+}
+
+const MAX_MB = resolveLimitMb(process.env.API_MAX_MB, DEFAULT_MAX_MB);
 const MAX_BYTES = MAX_MB * 1024 * 1024;
 const TELEGRAM_MAX_MB_CAP = 2048;
-const telegramLimitFromEnv = Number(process.env.TELEGRAM_MAX_MB || MAX_MB);
-let telegramMaxMb = Number.isFinite(telegramLimitFromEnv)
-  ? Math.max(1, Math.min(TELEGRAM_MAX_MB_CAP, Math.floor(telegramLimitFromEnv)))
-  : MAX_MB;
+const telegramMaxMb = resolveLimitMb(process.env.TELEGRAM_MAX_MB, MAX_MB, TELEGRAM_MAX_MB_CAP);
 const ADMIN_USER_ID = 5695514027;
 const ADMIN_USERNAME = "hayforks";
 const USERS_DB_PATH =
