@@ -622,6 +622,15 @@ function resolveTextWatermarkPlacement(preset, page, textWidth, textHeight) {
     };
   }
 
+  if (preset === "diag_lr") {
+    return {
+      x: (width - textWidth) / 2,
+      y: (height - textHeight) / 2,
+      rotate: degrees(45),
+      second: null
+    };
+  }
+
   return {
     // right to left diagonal
     x: (width - textWidth) / 2,
@@ -631,6 +640,74 @@ function resolveTextWatermarkPlacement(preset, page, textWidth, textHeight) {
   };
 }
 
+function drawTiledTextWatermark(page, text, font, textWidth, fontSize, angles = [-45]) {
+  const { width, height } = page.getSize();
+  const stepX = Math.max(textWidth * 1.6, 180);
+  const stepY = Math.max(fontSize * 4.2, 120);
+
+  for (let y = -height * 0.25; y <= height * 1.25; y += stepY) {
+    for (let x = -width * 0.3; x <= width * 1.2; x += stepX) {
+      for (const angle of angles) {
+        page.drawText(text, {
+          x,
+          y,
+          size: fontSize,
+          font,
+          color: rgb(0.45, 0.45, 0.45),
+          rotate: degrees(angle),
+          opacity: 0.16
+        });
+      }
+    }
+  }
+}
+
+function drawTextWatermarkOnPage(page, text, font, preset = "diag_rl") {
+  const { width } = page.getSize();
+  const fontSize = Math.max(Math.round(width * 0.065), 18);
+  const textWidth = font.widthOfTextAtSize(text, fontSize);
+  const textHeight = fontSize;
+
+  if (preset === "tile_rl") {
+    drawTiledTextWatermark(page, text, font, textWidth, fontSize, [-45]);
+    return;
+  }
+
+  if (preset === "tile_lr") {
+    drawTiledTextWatermark(page, text, font, textWidth, fontSize, [45]);
+    return;
+  }
+
+  if (preset === "tile_cross") {
+    drawTiledTextWatermark(page, text, font, textWidth, fontSize, [45, -45]);
+    return;
+  }
+
+  const placement = resolveTextWatermarkPlacement(preset, page, textWidth, textHeight);
+
+  page.drawText(text, {
+    x: placement.x,
+    y: placement.y,
+    size: fontSize,
+    font,
+    color: rgb(0.45, 0.45, 0.45),
+    rotate: placement.rotate,
+    opacity: 0.28
+  });
+
+  if (placement.second) {
+    page.drawText(text, {
+      x: placement.x,
+      y: placement.y,
+      size: fontSize,
+      font,
+      color: rgb(0.45, 0.45, 0.45),
+      rotate: placement.second.rotate,
+      opacity: 0.2
+    });
+  }
+}
+
 async function addTextWatermarkToPdf(inputPdfPath, outputPdfPath, text, preset = "diag_rl") {
   const srcBytes = await fs.readFile(inputPdfPath);
   const pdfDoc = await PDFDocument.load(srcBytes, { ignoreEncryption: true });
@@ -638,33 +715,38 @@ async function addTextWatermarkToPdf(inputPdfPath, outputPdfPath, text, preset =
 
   const pages = pdfDoc.getPages();
   for (const page of pages) {
-    const { width } = page.getSize();
-    const fontSize = Math.max(Math.round(width * 0.065), 18);
-    const textWidth = font.widthOfTextAtSize(text, fontSize);
-    const textHeight = fontSize;
-    const placement = resolveTextWatermarkPlacement(preset, page, textWidth, textHeight);
+    drawTextWatermarkOnPage(page, text, font, preset);
+  }
 
-    page.drawText(text, {
-      x: placement.x,
-      y: placement.y,
-      size: fontSize,
-      font,
-      color: rgb(0.45, 0.45, 0.45),
-      rotate: placement.rotate,
-      opacity: 0.28
+  await fs.writeFile(outputPdfPath, await pdfDoc.save());
+}
+
+async function addTextImageWatermarkToPdf(inputPdfPath, watermarkImagePath, outputPdfPath, text, preset = "diag_rl") {
+  const srcBytes = await fs.readFile(inputPdfPath);
+  const wmBytes = await fs.readFile(watermarkImagePath);
+  const pdfDoc = await PDFDocument.load(srcBytes, { ignoreEncryption: true });
+  const font = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+  const lower = path.extname(watermarkImagePath).toLowerCase();
+  const embedded = [".jpg", ".jpeg"].includes(lower)
+    ? await pdfDoc.embedJpg(wmBytes)
+    : await pdfDoc.embedPng(wmBytes);
+
+  for (const page of pdfDoc.getPages()) {
+    drawTextWatermarkOnPage(page, text, font, preset);
+
+    const { width, height } = page.getSize();
+    const baseW = Math.max(width * 0.25, 100);
+    const scale = baseW / embedded.width;
+    const wmW = embedded.width * scale;
+    const wmH = embedded.height * scale;
+    page.drawImage(embedded, {
+      x: (width - wmW) / 2,
+      y: (height - wmH) / 2,
+      width: wmW,
+      height: wmH,
+      opacity: 0.2
     });
-
-    if (placement.second) {
-      page.drawText(text, {
-        x: placement.x,
-        y: placement.y,
-        size: fontSize,
-        font,
-        color: rgb(0.45, 0.45, 0.45),
-        rotate: placement.second.rotate,
-        opacity: 0.2
-      });
-    }
   }
 
   await fs.writeFile(outputPdfPath, await pdfDoc.save());
@@ -1215,7 +1297,7 @@ app.get("/", (req, res) => {
       pdf_to_pptx: "POST /pdf-to-pptx (form-data key: file)",
       html_to_pdf: "POST /html-to-pdf (form-data key: file)",
       pdf_to_html: "POST /pdf-to-html (form-data key: file)",
-      pdf_watermark: "POST /pdf-watermark (form-data keys: file, watermark)",
+      pdf_watermark: "POST /pdf-watermark (form-data keys: file, watermark[optional], text[optional], preset[optional], mode=image|text|combo)",
       csv_to_xlsx: "POST /csv-to-xlsx (form-data key: file)",
       xlsx_to_csv: "POST /xlsx-to-csv (form-data key: file)",
       csv_to_json: "POST /csv-to-json (form-data key: file)",
@@ -1426,38 +1508,67 @@ app.post("/pdf-watermark", upload.fields([{ name: "file", maxCount: 1 }, { name:
   const watermarkInput = req.files?.watermark?.[0]?.path;
   const fileExt = path.extname(req.files?.file?.[0]?.originalname || "").toLowerCase();
   const watermarkExt = path.extname(req.files?.watermark?.[0]?.originalname || "").toLowerCase();
+  const mode = (req.body?.mode || "image").toLowerCase();
+  const text = (req.body?.text || "").toString().trim();
+  const preset = (req.body?.preset || "diag_rl").toString();
 
-  if (!fileInput || !watermarkInput) {
-    if (fileInput) await safeUnlink(fileInput);
+  if (!fileInput) {
     if (watermarkInput) await safeUnlink(watermarkInput);
-    return res.status(400).json({ ok: false, error: "Upload PDF in key:file and watermark image in key:watermark" });
+    return res.status(400).json({ ok: false, error: "Upload PDF in key:file" });
   }
 
-  if (fileExt !== ".pdf" || ![".png", ".jpg", ".jpeg"].includes(watermarkExt)) {
+  if (fileExt !== ".pdf") {
     await safeUnlink(fileInput);
-    await safeUnlink(watermarkInput);
-    return res.status(400).json({ ok: false, error: "File must be PDF and watermark must be PNG/JPG/JPEG" });
+    if (watermarkInput) await safeUnlink(watermarkInput);
+    return res.status(400).json({ ok: false, error: "File must be PDF" });
+  }
+
+  if (!["image", "text", "combo"].includes(mode)) {
+    await safeUnlink(fileInput);
+    if (watermarkInput) await safeUnlink(watermarkInput);
+    return res.status(400).json({ ok: false, error: "Invalid mode. Use image, text, or combo." });
+  }
+
+  if (["image", "combo"].includes(mode)) {
+    if (!watermarkInput || ![".png", ".jpg", ".jpeg"].includes(watermarkExt)) {
+      await safeUnlink(fileInput);
+      if (watermarkInput) await safeUnlink(watermarkInput);
+      return res.status(400).json({ ok: false, error: "For image/combo mode, watermark must be PNG/JPG/JPEG in key:watermark" });
+    }
+  }
+
+  if (["text", "combo"].includes(mode) && (text.length < 2 || text.length > 80)) {
+    await safeUnlink(fileInput);
+    if (watermarkInput) await safeUnlink(watermarkInput);
+    return res.status(400).json({ ok: false, error: "For text/combo mode, text must be 2-80 chars in field:text" });
   }
 
   const outPath = path.join(os.tmpdir(), randName(".pdf"));
   try {
-    await addImageWatermarkToPdf(fileInput, watermarkInput, outPath);
+    if (mode === "text") {
+      await addTextWatermarkToPdf(fileInput, outPath, text, preset);
+    } else if (mode === "combo") {
+      await addTextImageWatermarkToPdf(fileInput, watermarkInput, outPath, text, preset);
+    } else {
+      await addImageWatermarkToPdf(fileInput, watermarkInput, outPath);
+    }
+
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `attachment; filename="watermarked.pdf"`);
     createReadStream(outPath).pipe(res);
     res.on("finish", async () => {
       await safeUnlink(fileInput);
-      await safeUnlink(watermarkInput);
+      if (watermarkInput) await safeUnlink(watermarkInput);
       await safeUnlink(outPath);
     });
     res.on("close", async () => {
       await safeUnlink(fileInput);
-      await safeUnlink(watermarkInput);
+      if (watermarkInput) await safeUnlink(watermarkInput);
       await safeUnlink(outPath);
     });
   } catch (e) {
     await safeUnlink(fileInput);
-    await safeUnlink(watermarkInput);
+    if (watermarkInput) await safeUnlink(watermarkInput);
     await safeUnlink(outPath);
     res.status(500).json({ ok: false, error: e.message || "Watermark failed" });
   }
@@ -2004,7 +2115,7 @@ You’ll get smart buttons for every supported tool.
 • Send 2+ PDFs together with caption: merge
 • Tap Protect/Unlock → send password when asked
 • Scan mode: /scanpdf → send images → /done
-• Watermark mode: /watermark → send PDF → choose image/text mode
+• Watermark mode: /watermark → send PDF → choose image/text/combo mode
 
 📦 *Limits:*
 • Max file size: ${MAX_MB} MB
@@ -2175,6 +2286,8 @@ Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "
         const outPath = path.join(dir, "watermarked.pdf");
         if (context.watermarkMode === "text") {
           await addTextWatermarkToPdf(input, outPath, context.watermarkText, context.watermarkPreset);
+        } else if (context.watermarkMode === "combo") {
+          await addTextImageWatermarkToPdf(input, context.watermarkPath, outPath, context.watermarkText, context.watermarkPreset);
         } else {
           await addImageWatermarkToPdf(input, context.watermarkPath, outPath);
         }
@@ -2372,7 +2485,8 @@ Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "
     return {
       inline_keyboard: [[
         { text: "🖼️ Image watermark", callback_data: "wmmode:image" },
-        { text: "🔤 Text watermark", callback_data: "wmmode:text" }
+        { text: "🔤 Text watermark", callback_data: "wmmode:text" },
+        { text: "🧩 Text + Image", callback_data: "wmmode:combo" }
       ]]
     };
   }
@@ -2382,11 +2496,19 @@ Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "
       inline_keyboard: [
         [
           { text: "↘️ Diagonal (right→left)", callback_data: "wmpos:diag_rl" },
-          { text: "✖️ Cross", callback_data: "wmpos:cross" }
+          { text: "↙️ Diagonal (left→right)", callback_data: "wmpos:diag_lr" }
         ],
         [
           { text: "🎯 Center", callback_data: "wmpos:center" },
           { text: "↖️ Top-left straight", callback_data: "wmpos:top_left" }
+        ],
+        [
+          { text: "🔁 Full page right→left", callback_data: "wmpos:tile_rl" },
+          { text: "🔁 Full page left→right", callback_data: "wmpos:tile_lr" }
+        ],
+        [
+          { text: "🏛️ Institution style (both)", callback_data: "wmpos:tile_cross" },
+          { text: "✖️ Cross", callback_data: "wmpos:cross" }
         ]
       ]
     };
@@ -2464,7 +2586,7 @@ Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "
 Quick usage:
 • Send any file and pick button
 • Or use caption: to pdf / to docx / to pptx / to html
-• For watermark: use /watermark then send PDF, choose image or text mode
+• For watermark: use /watermark then send PDF, choose image, text, or combo mode
 
 Limit: ${MAX_MB} MB`;
 
@@ -2482,7 +2604,7 @@ Limit: ${MAX_MB} MB`;
 /ocr - OCR scanned PDF
 /translate - translate PDF language
 /scanpdf - merge images into one PDF
-/watermark - apply image or text watermark to PDF
+/watermark - apply image, text, or combo watermark to PDF
 /rename - rename any file
 /protect - protect PDF/ZIP with password
 /unlock - unlock PDF/ZIP with password
@@ -2518,7 +2640,7 @@ Use /users to view details.`;
     { command: "ocr", description: "OCR a scanned PDF" },
     { command: "translate", description: "Translate a PDF" },
     { command: "scanpdf", description: "Build one PDF from images" },
-    { command: "watermark", description: "Apply image/text watermark to PDF" },
+    { command: "watermark", description: "Apply image/text/combo watermark to PDF" },
     { command: "rename", description: "Rename any file and resend it" },
     { command: "protect", description: "Password-protect a PDF/ZIP" },
     { command: "unlock", description: "Unlock a PDF/ZIP" },
@@ -2636,7 +2758,7 @@ ${lines.join("\n")}` : "No registered users yet.");
   bot.onText(/\/watermark/, async (msg) => {
     if (!(await ensureRegisteredOrAdmin(msg))) return;
     pendingCommandFileActions.set(msg.chat.id, { target: "watermark" });
-    bot.sendMessage(msg.chat.id, "🖼️ Watermark mode: send a PDF first. Then choose image or text watermark mode.");
+    bot.sendMessage(msg.chat.id, "🖼️ Watermark mode: send a PDF first. Then choose image, text, or text+image watermark mode.");
   });
 
   bot.onText(/\/merge/, async (msg) => {
@@ -2868,7 +2990,7 @@ ${lines.join("\n")}` : "No registered users yet.");
       const sourcePath = await downloadTelegramFile(bot, fileId, workDir, { preferredExt: ext });
       const context = { watermarkMode, watermarkText, watermarkPreset };
 
-      if (watermarkMode === "image") {
+      if (["image", "combo"].includes(watermarkMode)) {
         context.watermarkPath = await downloadTelegramFile(bot, watermarkFileId, workDir, { preferredExt: watermarkExt });
       }
 
@@ -2926,7 +3048,8 @@ Send more or type /done`);
         ext: pendingWm.ext,
         watermarkFileId: best.file_id,
         watermarkExt: ".jpg",
-        watermarkMode: "image",
+        watermarkMode: pendingWm.mode || "image",
+        watermarkText: pendingWm.text || "",
         watermarkPreset: pendingWm.preset || "diag_rl"
       });
       return;
@@ -2999,7 +3122,8 @@ Send more or type /done`);
         ext: pendingWm.ext,
         watermarkFileId: doc.file_id,
         watermarkExt: ext,
-        watermarkMode: "image",
+        watermarkMode: pendingWm.mode || "image",
+        watermarkText: pendingWm.text || "",
         watermarkPreset: pendingWm.preset || "diag_rl"
       });
       return;
@@ -3253,7 +3377,7 @@ Send more or type /done`);
 
       if (data.startsWith("wmmode:")) {
         const mode = data.split(":")[1];
-        if (!mode || !["image", "text"].includes(mode)) {
+        if (!mode || !["image", "text", "combo"].includes(mode)) {
           await bot.answerCallbackQuery(query.id, { text: "Invalid mode." });
           return;
         }
@@ -3267,22 +3391,34 @@ Send more or type /done`);
           return;
         }
 
-        pendingWm.mode = "text";
+        pendingWm.mode = mode;
         pendingWm.stage = "awaiting_text";
         pendingWatermarkActions.set(chatId, pendingWm);
         await bot.answerCallbackQuery(query.id, { text: "Send watermark text" });
-        await bot.sendMessage(chatId, "🔤 Send watermark text (for example: Confidential / Draft / Your Brand).");
+        await bot.sendMessage(chatId, mode === "combo"
+          ? "🔤 Send watermark text first (for example: Confidential / Draft / Your Brand). After choosing style, you will send an image too."
+          : "🔤 Send watermark text (for example: Confidential / Draft / Your Brand)."
+        );
         return;
       }
 
       const preset = data.split(":")[1];
-      if (!preset || !["diag_rl", "cross", "center", "top_left"].includes(preset)) {
+      if (!preset || !["diag_rl", "diag_lr", "cross", "center", "top_left", "tile_rl", "tile_lr", "tile_cross"].includes(preset)) {
         await bot.answerCallbackQuery(query.id, { text: "Invalid watermark position." });
         return;
       }
 
       if (pendingWm.stage !== "choose_preset") {
         await bot.answerCallbackQuery(query.id, { text: "Set watermark text first." });
+        return;
+      }
+
+      if (pendingWm.mode === "combo") {
+        pendingWm.preset = preset;
+        pendingWm.stage = "awaiting_image";
+        pendingWatermarkActions.set(chatId, pendingWm);
+        await bot.answerCallbackQuery(query.id, { text: "Now send watermark image" });
+        await bot.sendMessage(chatId, "🖼️ Great. Now send watermark image (PNG/JPG/JPEG) for combined watermark.");
         return;
       }
 
@@ -3597,7 +3733,7 @@ Send more or type /done`);
       pendingWatermarkActions.set(chatId, pendingWm);
       await bot.sendMessage(
         chatId,
-        "Choose text watermark style and position\n• Diagonal right→left\n• Cross\n• Center\n• Top-left straight",
+        "Choose text watermark style and position\n• Diagonal right→left / left→right\n• Full-page repeat (institution style)\n• Cross\n• Center\n• Top-left straight",
         { reply_markup: buildWatermarkPresetKeyboard() }
       );
       await bot.sendMessage(chatId, "Suggestions: use short text like CONFIDENTIAL, DRAFT, INTERNAL, or your brand name.");
