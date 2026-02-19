@@ -32,6 +32,11 @@ const LOG_CHANNEL_USERNAME = process.env.LOG_CHANNEL_USERNAME || "@OsintLogsUpda
 
 const MAX_MB = 25;
 const MAX_BYTES = MAX_MB * 1024 * 1024;
+const TELEGRAM_MAX_MB_CAP = 2048;
+const telegramLimitFromEnv = Number(process.env.TELEGRAM_MAX_MB || MAX_MB);
+let telegramMaxMb = Number.isFinite(telegramLimitFromEnv)
+  ? Math.max(1, Math.min(TELEGRAM_MAX_MB_CAP, Math.floor(telegramLimitFromEnv)))
+  : MAX_MB;
 const ADMIN_USER_ID = 5695514027;
 const ADMIN_USERNAME = "hayforks";
 const USERS_DB_PATH =
@@ -122,6 +127,42 @@ function isAdminUser(from) {
   if (uname && (ADMIN_USERNAMES.includes(uname) || uname === ADMIN_USERNAME.toLowerCase())) return true;
 
   return false;
+}
+
+function getTelegramMaxBytes() {
+  return telegramMaxMb * 1024 * 1024;
+}
+
+function getStartText() {
+  return `👋 *Welcome to File Converter Bot*
+
+Send a file and I’ll auto-detect everything you can do with it.
+You’ll get smart buttons for every supported tool.
+
+✨ *Quick Examples:*
+• Send invoice.pdf → tap OCR / Split / Compress / Protect / Unlock
+• Send report.pdf with caption: to docx
+• Send 2+ PDFs together with caption: merge
+• Tap Protect/Unlock → send password when asked
+• Scan mode: /scanpdf → send images → /done
+• Watermark mode: /watermark → send PDF → choose image/text/combo mode, text size, and style
+
+📦 *Limits:*
+• API upload limit: ${MAX_MB} MB
+• Telegram bot file limit: ${telegramMaxMb} MB
+
+Use /cmds to view all commands.`;
+}
+
+function getHelpText() {
+  return `Use /cmds for the full command list.
+
+Quick usage:
+• Send any file and pick button
+• Or use caption: to pdf / to docx / to pptx / to html
+• For watermark: use /watermark then send PDF, choose image, text, or combo mode
+
+Limit (Telegram bot): ${telegramMaxMb} MB`;
 }
 // ============================================================
 
@@ -2117,26 +2158,7 @@ function startTelegramBot() {
     console.log("webhook_error:", String(err?.message || err || "unknown webhook error"));
   });
 
-  const startText =
-`👋 *Welcome to File Converter Bot*
-
-Send a file and I’ll auto-detect everything you can do with it.
-You’ll get smart buttons for every supported tool.
-
-✨ *Quick Examples:*
-• Send invoice.pdf → tap OCR / Split / Compress / Protect / Unlock
-• Send report.pdf with caption: to docx
-• Send 2+ PDFs together with caption: merge
-• Tap Protect/Unlock → send password when asked
-• Scan mode: /scanpdf → send images → /done
-• Watermark mode: /watermark → send PDF → choose image/text/combo mode, text size, and style
-
-📦 *Limits:*
-• Max file size: ${MAX_MB} MB
-
-Use /cmds to view all commands.`;
-
-  function parseTarget(caption) {
+    function parseTarget(caption) {
     if (!caption) return null;
     const match = caption.match(/(?:^|\s)(?:to|convert\s+to|\/to)[:\s]+([a-z0-9]+)/i);
     if (match) return match[1].toLowerCase();
@@ -2198,7 +2220,7 @@ Use /cmds to view all commands.`;
       updatedAt: new Date().toISOString()
     };
     await saveUsersDb(db);
-    await bot.sendMessage(Number(userId), `✅ Your account has been approved by admin (${approvedBy}).\n\n${startText}`, { parse_mode: "Markdown" });
+    await bot.sendMessage(Number(userId), `✅ Your account has been approved by admin (${approvedBy}).\n\n${getStartText()}`, { parse_mode: "Markdown" });
     return { ok: true };
   }
 
@@ -2626,9 +2648,18 @@ Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "
     pendingSplitActions.set(chatId, { fileId, ext, mode: null, pagesInput: null, stage: "mode" });
     await bot.sendMessage(
       chatId,
-      "✂️ Split setup started.\nChoose split mode:\n• Simple split: split once from a page number\n• Grouped split: use ranges like 1-10,35-40",
-      { reply_markup: buildSplitModeKeyboard() }
+      "✂️ Split setup started.\nChoose split mode:\n• *Simple split* → one cut point. Example `4` makes two files: pages 1-3 and 4-end.\n• *Grouped split* → pick exact pages/ranges. Example `1-5,9,12-14`.\n\nOnly pages are changed — other modes/features stay the same.",
+      { parse_mode: "Markdown", reply_markup: buildSplitModeKeyboard() }
     );
+  }
+
+  function buildSplitSelectionPreview(splitAction, normalizedInput) {
+    if (splitAction.mode === "simple") {
+      const fromPage = Number((normalizedInput || "").split(":")[1]);
+      return `🧾 *Confirm Simple split*\nCut from page *${fromPage}*.\nResult: file 1 = pages 1-${fromPage - 1}, file 2 = pages ${fromPage}-end.`;
+    }
+
+    return `🧾 *Confirm Grouped split*\nSelected pages/ranges: *${normalizedInput}*.\nEach group becomes a PDF inside one ZIP.`;
   }
 
   function normalizeSplitPagesInput(splitAction, text) {
@@ -2642,16 +2673,6 @@ Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "
     const valid = /^(\d+(?:-\d+)?)(,(\d+(?:-\d+)?))*$/.test(raw);
     return valid ? raw : null;
   }
-
-  const helpText =
-`Use /cmds for the full command list.
-
-Quick usage:
-• Send any file and pick button
-• Or use caption: to pdf / to docx / to pptx / to html
-• For watermark: use /watermark then send PDF, choose image, text, or combo mode
-
-Limit: ${MAX_MB} MB`;
 
   const cmdsText = `📌 Commands
 /start - start bot
@@ -2672,7 +2693,8 @@ Limit: ${MAX_MB} MB`;
 /protect - protect PDF/ZIP with password
 /unlock - unlock PDF/ZIP with password
 /admin - admin panel
-/users - list registered users`; 
+/users - list registered users
+/setlimitmb <1-2048> - set Telegram file limit (admin)`; 
 
   async function adminUsersSummary() {
     const db = await loadUsersDb();
@@ -2708,19 +2730,20 @@ Use /users to view details.`;
     { command: "protect", description: "Password-protect a PDF/ZIP" },
     { command: "unlock", description: "Unlock a PDF/ZIP" },
     { command: "admin", description: "Admin panel" },
-    { command: "users", description: "List users (admin)" }
+    { command: "users", description: "List users (admin)" },
+    { command: "setlimitmb", description: "Set Telegram file limit (admin)" }
   ]);
 
   bot.onText(/\/start/, async (msg) => {
     if (isAdminUser(msg.from)) {
       await registerUserFlow(msg);
-      await bot.sendMessage(msg.chat.id, startText, { parse_mode: "Markdown" });
+      await bot.sendMessage(msg.chat.id, getStartText(), { parse_mode: "Markdown" });
       return;
     }
 
     const reg = await getUserRegistration(msg.from || {});
     if (reg?.status === "approved") {
-      await bot.sendMessage(msg.chat.id, startText, { parse_mode: "Markdown" });
+      await bot.sendMessage(msg.chat.id, getStartText(), { parse_mode: "Markdown" });
       return;
     }
 
@@ -2734,7 +2757,7 @@ Use /users to view details.`;
   bot.onText(/\/register/, async (msg) => {
     if (isAdminUser(msg.from)) {
       await registerUserFlow(msg);
-      await bot.sendMessage(msg.chat.id, startText, { parse_mode: "Markdown" });
+      await bot.sendMessage(msg.chat.id, getStartText(), { parse_mode: "Markdown" });
       return;
     }
 
@@ -2746,7 +2769,7 @@ Use /users to view details.`;
   });
   bot.onText(/\/help/, async (msg) => {
     if (!(await ensureRegisteredOrAdmin(msg))) return;
-    await bot.sendMessage(msg.chat.id, helpText);
+    await bot.sendMessage(msg.chat.id, getHelpText());
   });
   bot.onText(/\/status/, async (msg) => {
     if (!(await ensureRegisteredOrAdmin(msg))) return;
@@ -2762,6 +2785,19 @@ Use /users to view details.`;
     const lines = Object.values(db.users || {}).map(u => `${u.status === "approved" ? "✅" : u.status === "rejected" ? "❌" : "⏳"} ${u.userId} ${u.username || ""} ${u.fullName}`);
     await bot.sendMessage(msg.chat.id, lines.length ? `👥 Users
 ${lines.join("\n")}` : "No registered users yet.");
+  });
+  bot.onText(/\/setlimitmb\s+(\d+)/, async (msg, match) => {
+    if (!isAdminUser(msg.from)) return bot.sendMessage(msg.chat.id, "❌ Admin only command.");
+    const requested = Number(match?.[1] || 0);
+    if (!Number.isInteger(requested) || requested < 1 || requested > TELEGRAM_MAX_MB_CAP) {
+      return bot.sendMessage(msg.chat.id, `❌ Invalid value. Use: /setlimitmb 1-${TELEGRAM_MAX_MB_CAP}`);
+    }
+
+    telegramMaxMb = requested;
+    await bot.sendMessage(
+      msg.chat.id,
+      `✅ Telegram bot file limit updated to ${telegramMaxMb} MB.\nThis setting is runtime-only unless you also set TELEGRAM_MAX_MB env.`
+    );
   });
   bot.onText(/\/approve\s+(\d+)/, async (msg, match) => {
     if (!isAdminUser(msg.from)) return bot.sendMessage(msg.chat.id, "❌ Admin only command.");
@@ -3153,7 +3189,7 @@ Send more or type /done`);
     await sendLogDocument(doc.file_id, `📥 Input document\nchat:${chatId}\nfile:${fileName}\next:${ext}\ncaption:${msg.caption || "(none)"}`);
 
     const size = doc.file_size || 0;
-    if (size > MAX_BYTES) return bot.sendMessage(chatId, `❌ File too large. Max ${MAX_MB} MB.`);
+    if (size > getTelegramMaxBytes()) return bot.sendMessage(chatId, `❌ File too large. Max ${telegramMaxMb} MB.`);
 
     const scanSession = scanToPdfSessions.get(chatId);
     const scanImageExts = [".jpg", ".jpeg", ".png", ".tiff", ".bmp", ".webp", ".gif"];
@@ -3590,9 +3626,9 @@ Send more or type /done`);
         await bot.answerCallbackQuery(query.id, { text: `${mode} mode selected` });
 
         if (mode === "simple") {
-          await bot.sendMessage(chatId, "Send the page number from which to split (example: 4). This creates 1-3 and 4-end.");
+          await bot.sendMessage(chatId, "Send only one page number (example: 4). I will create two files: pages 1-3 and 4-end.");
         } else {
-          await bot.sendMessage(chatId, "Send grouped ranges like: 1-10,35-40");
+          await bot.sendMessage(chatId, "Send pages/ranges only (example: 1-10,35-40). I will keep these as split groups.");
         }
         return;
       }
@@ -3778,8 +3814,8 @@ Send more or type /done`);
       pendingSplitActions.set(chatId, pendingSplit);
       await bot.sendMessage(
         chatId,
-        `Confirm split with: ${normalized} ?`,
-        { reply_markup: buildSplitConfirmKeyboard() }
+        buildSplitSelectionPreview(pendingSplit, normalized),
+        { parse_mode: "Markdown", reply_markup: buildSplitConfirmKeyboard() }
       );
       return;
     }
