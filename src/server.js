@@ -42,9 +42,10 @@ function resolveLimitMb(rawValue, fallbackMb, capMb = MAX_FILE_MB_CAP) {
 const MAX_MB = resolveLimitMb(process.env.API_MAX_MB, DEFAULT_MAX_MB);
 const MAX_BYTES = MAX_MB * 1024 * 1024;
 const TELEGRAM_MAX_MB_CAP = 2048;
-const telegramMaxMb = resolveLimitMb(process.env.TELEGRAM_MAX_MB, MAX_MB, TELEGRAM_MAX_MB_CAP);
-const ADMIN_USER_ID = 5695514027;
-const ADMIN_USERNAME = "hayforks";
+let telegramSendMaxMb = resolveLimitMb(process.env.TELEGRAM_MAX_MB, MAX_MB, TELEGRAM_MAX_MB_CAP);
+// Telegram hard limit for user -> bot uploads (cannot be increased by server/hosting)
+const TELEGRAM_INCOMING_MAX_MB = 25;
+const TELEGRAM_INCOMING_MAX_BYTES = TELEGRAM_INCOMING_MAX_MB * 1024 * 1024;
 const USERS_DB_PATH =
   process.env.USERS_DB_PATH ||
   path.join(process.cwd(), "data", "users.json");
@@ -119,24 +120,28 @@ const ADMIN_USERNAMES = (process.env.ADMIN_USERNAMES || "")
   .map((s) => s.trim().replace(/^@/, "").toLowerCase())
   .filter(Boolean);
 
+if (!ADMIN_IDS.length && !ADMIN_USERNAMES.length) {
+  console.warn("[WARN] No admins configured. Set ADMIN_IDS or ADMIN_USERNAMES env to enable admin commands.");
+}
+
 function isAdminUser(from) {
   if (!from) return false;
 
   // Admin by Telegram numeric user id
   if (Number.isFinite(from.id) && ADMIN_IDS.includes(from.id)) return true;
-
-  // Backward compatible default admin values
-  if (from.id === ADMIN_USER_ID) return true;
-
   // Optional: admin by username (less reliable than id)
   const uname = (from.username || "").toLowerCase();
-  if (uname && (ADMIN_USERNAMES.includes(uname) || uname === ADMIN_USERNAME.toLowerCase())) return true;
+  if (uname && ADMIN_USERNAMES.includes(uname)) return true;
 
   return false;
 }
 
-function getTelegramMaxBytes() {
-  return telegramMaxMb * 1024 * 1024;
+function getTelegramIncomingMaxBytes() {
+  return TELEGRAM_INCOMING_MAX_BYTES;
+}
+
+function getTelegramSendMaxBytes() {
+  return telegramSendMaxMb * 1024 * 1024;
 }
 
 function getStartText() {
@@ -155,7 +160,8 @@ You’ll get smart buttons for every supported tool.
 
 📦 *Limits:*
 • API upload limit: ${MAX_MB} MB
-• Telegram bot file limit: ${telegramMaxMb} MB
+• Telegram upload limit (user → bot): ${TELEGRAM_INCOMING_MAX_MB} MB
+• Bot send limit (config): ${telegramSendMaxMb} MB
 
 Use /cmds to view all commands.`;
 }
@@ -168,7 +174,7 @@ Quick usage:
 • Or use caption: to pdf / to docx / to pptx / to html
 • For watermark: use /watermark then send PDF, choose image, text, or combo mode
 
-Limit (Telegram bot): ${telegramMaxMb} MB`;
+Limit (Telegram upload to bot): ${TELEGRAM_INCOMING_MAX_MB} MB`;
 }
 // ============================================================
 
@@ -1378,8 +1384,27 @@ app.get("/", (req, res) => {
 });
 
 
+const DIAGNOSTICS_KEY = process.env.DIAGNOSTICS_KEY || "";
+const DIAGNOSTICS_ENABLED = (process.env.DIAGNOSTICS_ENABLED || "").toLowerCase() === "true";
+let diagnosticsCache = { ts: 0, report: null };
+const DIAGNOSTICS_CACHE_MS = 15 * 60 * 1000;
+
 app.get("/diagnostics", async (req, res) => {
+  if (!DIAGNOSTICS_ENABLED) return res.status(404).json({ ok: false, error: "Not found" });
+
+  const key = String(req.headers["x-admin-key"] || "");
+  if (!DIAGNOSTICS_KEY || key !== DIAGNOSTICS_KEY) {
+    return res.status(403).json({ ok: false, error: "Forbidden" });
+  }
+
+  const now = Date.now();
+  if (diagnosticsCache.report && (now - diagnosticsCache.ts) < DIAGNOSTICS_CACHE_MS) {
+    const cached = diagnosticsCache.report;
+    return res.status(cached.ok ? 200 : 503).json({ ...cached, cached: true });
+  }
+
   const report = await detectErrorsAndUpdates();
+  diagnosticsCache = { ts: now, report };
   res.status(report.ok ? 200 : 503).json(report);
 });
 
@@ -2247,6 +2272,15 @@ function startTelegramBot() {
     return { ok: true };
   }
 
+  async function notifyAdmins(message, extra = {}) {
+    const ids = (ADMIN_IDS || []).filter((n) => Number.isFinite(n));
+    if (!ids.length) {
+      console.warn("[WARN] Registration request received but no ADMIN_IDS configured.");
+      return;
+    }
+    await Promise.allSettled(ids.map((id) => bot.sendMessage(id, message, extra)));
+  }
+
   async function registerUserFlow(msg) {
     if (msg.chat.type !== "private") return;
 
@@ -2278,7 +2312,7 @@ function startTelegramBot() {
 ID: ${msg.from.id}
 User: ${msg.from.username ? `@${msg.from.username}` : "(no username)"}
 Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "Unknown"}`;
-    await bot.sendMessage(ADMIN_USER_ID, note, { reply_markup: buildApprovalKeyboard(msg.from.id) });
+    await notifyAdmins(note, { reply_markup: buildApprovalKeyboard(msg.from.id) });
   }
 
   const telegramConversions = {
@@ -2627,12 +2661,26 @@ Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "
     if (pendingRename.timer) clearTimeout(pendingRename.timer);
 
     try {
-      await bot.sendDocument(
+      const sent = await bot.sendDocument(
         chatId,
         pendingRename.outputPath,
         { caption: `✅ ${pendingRename.conversionLabel}` },
         { filename: finalName, contentType: pendingRename.contentType }
       );
+
+      const sentFileId = sent?.document?.file_id || null;
+      if (sentFileId) {
+        lastOutputByChat.set(String(chatId), { fileId: sentFileId, label: pendingRename.conversionLabel, name: finalName });
+      }
+
+      await bot.sendMessage(chatId, "✨ Done. Choose next step:", {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "⬇️ Download again", callback_data: `job:download:last` },
+            { text: "🆕 New Task", callback_data: `job:new:last` }
+          ]]
+        }
+      });
 
       await sendLogDocument(
         pendingRename.outputPath,
@@ -2799,10 +2847,10 @@ ${lines.join("\n")}` : "No registered users yet.");
       return bot.sendMessage(msg.chat.id, `❌ Invalid value. Use: /setlimitmb 1-${TELEGRAM_MAX_MB_CAP}`);
     }
 
-    telegramMaxMb = requested;
+    telegramSendMaxMb = requested;
     await bot.sendMessage(
       msg.chat.id,
-      `✅ Telegram bot file limit updated to ${telegramMaxMb} MB.\nThis setting is runtime-only unless you also set TELEGRAM_MAX_MB env.`
+      `✅ Telegram bot file limit updated to ${telegramSendMaxMb} MB.\nThis setting is runtime-only unless you also set TELEGRAM_MAX_MB env.`
     );
   });
   bot.onText(/\/approve\s+(\d+)/, async (msg, match) => {
@@ -3028,10 +3076,64 @@ ${lines.join("\n")}` : "No registered users yet.");
     }, 1500);
   }
 
-  async function performConversion({ chatId, conversion, fileId, ext, resolvedTarget, context = {} }) {
-    const status = await bot.sendMessage(chatId, `⏳ *${conversion.label}*\nDownloading...`, {
-      parse_mode: "Markdown"
+  const activeJobs = new Map();
+const lastOutputByChat = new Map();
+
+function newJobId() {
+  return crypto.randomBytes(8).toString("hex");
+}
+
+function buildJobKeyboard(jobId, stage) {
+  if (stage === "running") {
+    return { inline_keyboard: [[{ text: "✖️ Cancel", callback_data: `job:cancel:${jobId}` }]] };
+  }
+  return {
+    inline_keyboard: [[
+      { text: "⬇️ Download", callback_data: `job:download:${jobId}` },
+      { text: "🔁 Retry", callback_data: `job:retry:${jobId}` }
+    ], [
+      { text: "🆕 New Task", callback_data: `job:new:${jobId}` }
+    ]]
+  };
+}
+
+async function upsertJobStatus(bot, job, stepIndex, totalSteps, title, line) {
+  const text = `*${title}*\n${line}\n\n${stepIndex}/${totalSteps}`;
+  try {
+    await bot.editMessageText(text, {
+      chat_id: job.chatId,
+      message_id: job.statusMessageId,
+      parse_mode: "Markdown",
+      reply_markup: buildJobKeyboard(job.id, job.stage)
     });
+  } catch {}
+}
+
+function isJobCanceled(job) {
+  return Boolean(job?.canceled) || Boolean(job?.abortController?.signal?.aborted);
+}
+
+async function performConversion({ chatId, conversion, fileId, ext, resolvedTarget, context = {} }) {
+    const jobId = newJobId();
+    const status = await bot.sendMessage(chatId, `✅ *${conversion.label}*
+Received.`, {
+      parse_mode: "Markdown",
+      reply_markup: buildJobKeyboard(jobId, "running")
+    });
+
+    const job = {
+      id: jobId,
+      chatId,
+      statusMessageId: status.message_id,
+      stage: "running",
+      canceled: false,
+      abortController: new AbortController(),
+      retry: { chatId, conversion, fileId, ext, resolvedTarget, context }
+    };
+    activeJobs.set(jobId, job);
+
+    const TOTAL_STEPS = 5;
+    await upsertJobStatus(bot, job, 1, TOTAL_STEPS, conversion.label, "✅ Received");
 
     const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "tg-"));
     let outputPath = path.join(os.tmpdir(), randName(conversion.outputExt));
@@ -3042,20 +3144,18 @@ ${lines.join("\n")}` : "No registered users yet.");
 
       const downloadedPath = await downloadTelegramFile(bot, fileId, workDir, { preferredExt: ext });
 
-      await bot.editMessageText(`⚙️ *${conversion.label}*\nPlease wait...`, {
-        chat_id: chatId,
-        message_id: status.message_id,
-        parse_mode: "Markdown"
-      });
+      if (isJobCanceled(job)) throw new Error('Canceled');
+
+      await upsertJobStatus(bot, job, 2, TOTAL_STEPS, conversion.label, "⬇️ Downloading");
+
+      if (isJobCanceled(job)) throw new Error('Canceled');
+      await upsertJobStatus(bot, job, 3, TOTAL_STEPS, conversion.label, "🔄 Converting");
 
       const convertedPath = await conversion.convert(downloadedPath, workDir, context);
       await fs.copyFile(convertedPath, outputPath);
 
-      await bot.editMessageText(`✅ *${conversion.label}*\nUploading...`, {
-        chat_id: chatId,
-        message_id: status.message_id,
-        parse_mode: "Markdown"
-      });
+      if (isJobCanceled(job)) throw new Error('Canceled');
+      await upsertJobStatus(bot, job, 4, TOTAL_STEPS, conversion.label, "⬆️ Uploading");
 
       const defaultBaseName = sanitizeOutputBaseName(
         path.basename(convertedPath, path.extname(convertedPath)) || `${resolvedTarget || "converted"}-file`
@@ -3210,7 +3310,7 @@ Send more or type /done`);
     await sendLogDocument(doc.file_id, `📥 Input document\nchat:${chatId}\nfile:${fileName}\next:${ext}\ncaption:${msg.caption || "(none)"}`);
 
     const size = doc.file_size || 0;
-    if (size > getTelegramMaxBytes()) return bot.sendMessage(chatId, `❌ File too large. Max ${telegramMaxMb} MB.`);
+    if (size > getTelegramMaxBytes()) return bot.sendMessage(chatId, `❌ File too large. Max ${telegramSendMaxMb} MB.`);
 
     const scanSession = scanToPdfSessions.get(chatId);
     const scanImageExts = [".jpg", ".jpeg", ".png", ".tiff", ".bmp", ".webp", ".gif"];
@@ -3457,6 +3557,62 @@ Send more or type /done`);
         ? "Account pending approval"
         : "Use /register first";
       await bot.answerCallbackQuery(query.id, { text: message });
+      return;
+    }
+
+    if (data.startsWith("job:")) {
+      const [, action, jobId] = data.split(":");
+      const fallbackChatId = query.message?.chat?.id || query.from?.id;
+      const job = (jobId === "last") ? { chatId: fallbackChatId } : activeJobs.get(jobId);
+      if (!job || !job.chatId) {
+        await bot.answerCallbackQuery(query.id, { text: "Job expired." });
+        return;
+      }
+
+      if (action === "cancel") {
+        const realJob = activeJobs.get(jobId);
+        if (realJob) {
+          realJob.canceled = true;
+          try { realJob.abortController.abort(); } catch {}
+          activeJobs.set(jobId, realJob);
+          await bot.answerCallbackQuery(query.id, { text: "Cancel requested" });
+          await upsertJobStatus(bot, realJob, 0, 5, realJob.retry?.conversion?.label || 'Job', '\u2716 Canceling…');
+        } else {
+          await bot.answerCallbackQuery(query.id, { text: "Job expired." });
+        }
+        return;
+      }
+
+      if (action === "retry") {
+        const realJob = activeJobs.get(jobId);
+        const r = realJob?.retry;
+        if (!r) {
+          await bot.answerCallbackQuery(query.id, { text: "Nothing to retry." });
+          return;
+        }
+        await bot.answerCallbackQuery(query.id, { text: "Retrying…" });
+        await performConversion({ ...r });
+        return;
+      }
+
+      if (action === "download") {
+        const last = lastOutputByChat.get(String(job.chatId));
+        if (!last?.fileId) {
+          await bot.answerCallbackQuery(query.id, { text: "No file yet." });
+          return;
+        }
+        await bot.answerCallbackQuery(query.id, { text: "Sending…" });
+        await bot.sendDocument(job.chatId, last.fileId, { caption: `⬇️ ${last.label || 'File'}` });
+        return;
+      }
+
+      if (action === "new") {
+        await bot.answerCallbackQuery(query.id, { text: "Ready" });
+        await bot.sendMessage(job.chatId, "🆕 Send a new file to start.");
+        return;
+      }
+
+      await bot.answerCallbackQuery(query.id);
       return;
     }
 
