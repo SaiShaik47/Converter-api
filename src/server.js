@@ -16,6 +16,7 @@ import https from "https";
 import archiver from "archiver";
 import { Document, Packer, Paragraph } from "docx";
 import { createCanvas, loadImage } from "@napi-rs/canvas";
+import { pathToFileURL } from "url";
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 
 /* =========================
@@ -49,6 +50,9 @@ const TELEGRAM_INCOMING_MAX_BYTES = TELEGRAM_INCOMING_MAX_MB * 1024 * 1024;
 const USERS_DB_PATH =
   process.env.USERS_DB_PATH ||
   path.join(process.cwd(), "data", "users.json");
+const standardFontDataUrl = pathToFileURL(
+  path.resolve(process.cwd(), "node_modules/pdfjs-dist/standard_fonts/")
+).toString();
 
 async function ensureUsersDbFile() {
   const dir = path.dirname(USERS_DB_PATH);
@@ -385,7 +389,11 @@ async function pdfToDocx(pdfPath, docxPath) {
  */
 async function renderPdfToPngs(pdfPath, outDir) {
   const data = new Uint8Array(await fs.readFile(pdfPath));
-  const loadingTask = pdfjsLib.getDocument({ data, disableWorker: true });
+  const loadingTask = pdfjsLib.getDocument({
+    data,
+    disableWorker: true,
+    standardFontDataUrl
+  });
   const pdfDoc = await loadingTask.promise;
   const outputFiles = [];
 
