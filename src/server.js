@@ -15,7 +15,7 @@ import { PDFDocument, StandardFonts, degrees, rgb } from "pdf-lib";
 import https from "https";
 import archiver from "archiver";
 import { Document, Packer, Paragraph } from "docx";
-import { createCanvas } from "@napi-rs/canvas";
+import { createCanvas, loadImage } from "@napi-rs/canvas";
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 
 /* =========================
@@ -157,6 +157,7 @@ You’ll get smart buttons for every supported tool.
 • Tap Protect/Unlock → send password when asked
 • Scan mode: /scanpdf → send images → /done
 • Watermark mode: /watermark → send PDF → choose image/text/combo mode, text size, and style
+• Remove watermark mode: /watermarkremove → send PDF and get a cleaned copy
 
 📦 *Limits:*
 • API upload limit: ${MAX_MB} MB
@@ -173,6 +174,7 @@ Quick usage:
 • Send any file and pick button
 • Or use caption: to pdf / to docx / to pptx / to html
 • For watermark: use /watermark then send PDF, choose image, text, or combo mode
+• For watermark removal: use /watermarkremove then send PDF
 
 Limit (Telegram upload to bot): ${TELEGRAM_INCOMING_MAX_MB} MB`;
 }
@@ -812,6 +814,47 @@ async function addTextImageWatermarkToPdf(inputPdfPath, watermarkImagePath, outp
   await fs.writeFile(outputPdfPath, await pdfDoc.save());
 }
 
+async function removeLightWatermarkFromPdf(inputPdfPath, outputPdfPath, workDir) {
+  const pagePngs = await renderPdfToPngs(inputPdfPath, workDir);
+  const cleanedPngs = [];
+
+  for (let i = 0; i < pagePngs.length; i += 1) {
+    const source = pagePngs[i];
+    const image = await loadImage(source);
+    const canvas = createCanvas(image.width, image.height);
+    const context = canvas.getContext("2d");
+    context.drawImage(image, 0, 0, image.width, image.height);
+
+    const imageData = context.getImageData(0, 0, image.width, image.height);
+    const data = imageData.data;
+
+    for (let px = 0; px < data.length; px += 4) {
+      const r = data[px];
+      const g = data[px + 1];
+      const b = data[px + 2];
+      const brightness = (r + g + b) / 3;
+      const spread = Math.max(r, g, b) - Math.min(r, g, b);
+
+      if (brightness > 160) {
+        data[px] = 255;
+        data[px + 1] = 255;
+        data[px + 2] = 255;
+      } else if (brightness < 145 && spread < 45) {
+        data[px] = 0;
+        data[px + 1] = 0;
+        data[px + 2] = 0;
+      }
+    }
+
+    context.putImageData(imageData, 0, 0);
+    const cleanedPath = path.join(workDir, `cleaned-page-${i + 1}.png`);
+    await fs.writeFile(cleanedPath, canvas.toBuffer("image/png"));
+    cleanedPngs.push(cleanedPath);
+  }
+
+  await imagesToPdf(cleanedPngs, outputPdfPath);
+}
+
 async function collectFilesRecursive(rootDir) {
   const out = [];
   async function walk(dir) {
@@ -1358,6 +1401,7 @@ app.get("/", (req, res) => {
       html_to_pdf: "POST /html-to-pdf (form-data key: file)",
       pdf_to_html: "POST /pdf-to-html (form-data key: file)",
       pdf_watermark: "POST /pdf-watermark (form-data keys: file, watermark[optional], text[optional], preset[optional], size=small|medium|large[optional], mode=image|text|combo)",
+      pdf_watermark_remove: "POST /pdf-watermark-remove (form-data key: file)",
       csv_to_xlsx: "POST /csv-to-xlsx (form-data key: file)",
       xlsx_to_csv: "POST /xlsx-to-csv (form-data key: file)",
       csv_to_json: "POST /csv-to-json (form-data key: file)",
@@ -1658,6 +1702,21 @@ app.post("/pdf-watermark", upload.fields([{ name: "file", maxCount: 1 }, { name:
     await safeUnlink(outPath);
     res.status(500).json({ ok: false, error: e.message || "Watermark failed" });
   }
+});
+
+app.post("/pdf-watermark-remove", upload.single("file"), async (req, res) => {
+  await handleFileConversion(req, res, {
+    allowedExts: [".pdf"],
+    invalidExtMessage: "Only .pdf allowed",
+    workPrefix: "pwmr-",
+    contentType: "application/pdf",
+    outputName: "watermark-removed.pdf",
+    convert: async (inputPath, workDir) => {
+      const outPath = path.join(workDir, "watermark-removed.pdf");
+      await removeLightWatermarkFromPdf(inputPath, outPath, workDir);
+      return outPath;
+    }
+  });
 });
 
 app.post("/csv-to-xlsx", upload.single("file"), async (req, res) => {
@@ -2369,6 +2428,11 @@ Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "
         }
         return outPath;
       }},
+      watermark_remove: { label: "PDF → Remove Watermark", outputExt: ".pdf", convert: async (input, dir) => {
+        const outPath = path.join(dir, "watermark-removed.pdf");
+        await removeLightWatermarkFromPdf(input, outPath, dir);
+        return outPath;
+      }},
       images: { label: "PDF → Images (ZIP)", outputExt: ".zip", convert: async (input, dir) => {
         const outPath = path.join(dir, "images.zip");
         await pdfToImagesZip(input, outPath, dir);
@@ -2743,6 +2807,7 @@ Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "
 /translate - translate PDF language
 /scanpdf - merge images into one PDF
 /watermark - apply image, text, or combo watermark to PDF
+/watermarkremove - reduce/remove light watermark from PDF
 /rename - rename any file
 /protect - protect PDF/ZIP with password
 /unlock - unlock PDF/ZIP with password
@@ -2780,6 +2845,7 @@ Use /users to view details.`;
     { command: "translate", description: "Translate a PDF" },
     { command: "scanpdf", description: "Build one PDF from images" },
     { command: "watermark", description: "Apply image/text/combo watermark to PDF" },
+    { command: "watermarkremove", description: "Reduce/remove light watermark from PDF" },
     { command: "rename", description: "Rename any file and resend it" },
     { command: "protect", description: "Password-protect a PDF/ZIP" },
     { command: "unlock", description: "Unlock a PDF/ZIP" },
@@ -2908,10 +2974,15 @@ ${lines.join("\n")}` : "No registered users yet.");
     pendingCommandFileActions.set(msg.chat.id, { target: "unlock" });
     bot.sendMessage(msg.chat.id, "🔓 Unlock mode: Please send a PDF or ZIP file first.");
   });
-  bot.onText(/\/watermark/, async (msg) => {
+  bot.onText(/^\/watermark$/, async (msg) => {
     if (!(await ensureRegisteredOrAdmin(msg))) return;
     pendingCommandFileActions.set(msg.chat.id, { target: "watermark" });
     bot.sendMessage(msg.chat.id, "🖼️ Watermark mode: send a PDF first. Then choose image, text, or text+image watermark mode with size/style options.");
+  });
+  bot.onText(/^\/watermarkremove$/, async (msg) => {
+    if (!(await ensureRegisteredOrAdmin(msg))) return;
+    pendingCommandFileActions.set(msg.chat.id, { target: "watermark_remove" });
+    bot.sendMessage(msg.chat.id, "🧼 Watermark remove mode: send a PDF first. I will reduce/remove light watermark layers and send a cleaned copy.");
   });
 
   bot.onText(/\/merge/, async (msg) => {
