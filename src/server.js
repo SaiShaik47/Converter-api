@@ -2915,7 +2915,12 @@ ${lines.join("\n")}` : "No registered users yet.");
           message_id: status.message_id
         });
 
-        await bot.sendDocument(chatId, outputPath, { caption: "✅ Scan to PDF" });
+        await bot.sendDocument(
+          chatId,
+          outputPath,
+          { caption: "✅ Scan to PDF" },
+          { filename: path.basename(outputPath), contentType: "application/pdf" }
+        );
       } catch (e) {
         await bot.sendMessage(chatId, `❌ Scan to PDF failed.\nReason: ${e.message}`);
       } finally {
@@ -2957,7 +2962,12 @@ ${lines.join("\n")}` : "No registered users yet.");
         message_id: status.message_id
       });
 
-      await bot.sendDocument(chatId, outputPath, { caption: "✅ PDF merge" });
+      await bot.sendDocument(
+        chatId,
+        outputPath,
+        { caption: "✅ PDF merge" },
+        { filename: path.basename(outputPath), contentType: "application/pdf" }
+      );
     } catch (e) {
       await bot.sendMessage(chatId, `❌ Merge failed.\nReason: ${e.message}`);
     } finally {
@@ -3003,7 +3013,12 @@ ${lines.join("\n")}` : "No registered users yet.");
           message_id: status.message_id
         });
 
-        await bot.sendDocument(pending.chatId, outputPath, { caption: "✅ PDF merge" });
+        await bot.sendDocument(
+          pending.chatId,
+          outputPath,
+          { caption: "✅ PDF merge" },
+          { filename: path.basename(outputPath), contentType: "application/pdf" }
+        );
       } catch (e) {
         await bot.sendMessage(pending.chatId, `❌ Merge failed.\nReason: ${e.message}`);
       } finally {
