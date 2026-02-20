@@ -3310,7 +3310,7 @@ Send more or type /done`);
     await sendLogDocument(doc.file_id, `📥 Input document\nchat:${chatId}\nfile:${fileName}\next:${ext}\ncaption:${msg.caption || "(none)"}`);
 
     const size = doc.file_size || 0;
-    if (size > getTelegramMaxBytes()) return bot.sendMessage(chatId, `❌ File too large. Max ${telegramSendMaxMb} MB.`);
+    if (size > getTelegramSendMaxBytes()) return bot.sendMessage(chatId, `❌ File too large. Max ${telegramSendMaxMb} MB.`);
 
     const scanSession = scanToPdfSessions.get(chatId);
     const scanImageExts = [".jpg", ".jpeg", ".png", ".tiff", ".bmp", ".webp", ".gif"];
