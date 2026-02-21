@@ -1,10 +1,10 @@
 FROM node:20-bookworm-slim
 
-# Install LibreOffice (Excel->PDF) + Java (Tabula PDF->Excel) + OCR deps + fonts + qpdf (protect/unlock)
+# Install LibreOffice (Excel->PDF) + Java (Tabula PDF->Excel) + OCR deps + fonts + qpdf + 7z (protect/unlock)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-core libreoffice-calc \
     fonts-dejavu fonts-liberation \
-    default-jre wget qpdf \
+    default-jre wget qpdf p7zip-full \
     tesseract-ocr tesseract-ocr-eng ocrmypdf ghostscript \
   && rm -rf /var/lib/apt/lists/*
 
