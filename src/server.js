@@ -836,6 +836,9 @@ async function removeLightWatermarkFromPdf(inputPdfPath, outputPdfPath, workDir)
     const imageData = context.getImageData(0, 0, image.width, image.height);
     const data = imageData.data;
 
+    const pixelCount = image.width * image.height;
+    const candidateMask = new Uint8Array(pixelCount);
+
     for (let px = 0; px < data.length; px += 4) {
       const r = data[px];
       const g = data[px + 1];
@@ -845,19 +848,86 @@ async function removeLightWatermarkFromPdf(inputPdfPath, outputPdfPath, workDir)
       const spread = Math.max(r, g, b) - Math.min(r, g, b);
       const likelyLightGrayWatermark =
         alpha > 0 &&
-        spread < 20 &&
-        brightness >= 165 &&
-        brightness <= 245;
+        spread < 18 &&
+        brightness >= 175 &&
+        brightness <= 238;
 
-      // Only target the typical light-gray watermark band, so body text/tables stay intact.
       if (likelyLightGrayWatermark) {
-        data[px] = 255;
-        data[px + 1] = 255;
-        data[px + 2] = 255;
+        candidateMask[px / 4] = 1;
       } else if (brightness < 100 && spread < 35) {
         data[px] = 0;
         data[px + 1] = 0;
         data[px + 2] = 0;
+      }
+    }
+
+    // Avoid deleting document text: remove only large connected light-gray regions.
+    const visited = new Uint8Array(pixelCount);
+    const queue = [];
+    const minComponentSize = 550;
+    const minBoxWidth = 45;
+    const minBoxHeight = 24;
+    const w = image.width;
+    const h = image.height;
+
+    for (let idx = 0; idx < pixelCount; idx += 1) {
+      if (!candidateMask[idx] || visited[idx]) continue;
+
+      queue.length = 0;
+      queue.push(idx);
+      visited[idx] = 1;
+      const component = [];
+      let minX = w;
+      let maxX = 0;
+      let minY = h;
+      let maxY = 0;
+
+      while (queue.length) {
+        const current = queue.pop();
+        component.push(current);
+        const y = Math.floor(current / w);
+        const x = current - y * w;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+
+        const neighbors = [
+          current - 1,
+          current + 1,
+          current - w,
+          current + w,
+          current - w - 1,
+          current - w + 1,
+          current + w - 1,
+          current + w + 1
+        ];
+
+        for (const neighbor of neighbors) {
+          if (neighbor < 0 || neighbor >= pixelCount) continue;
+          const ny = Math.floor(neighbor / w);
+          const nx = neighbor - ny * w;
+          if (Math.abs(nx - x) > 1 || Math.abs(ny - y) > 1) continue;
+          if (!candidateMask[neighbor] || visited[neighbor]) continue;
+          visited[neighbor] = 1;
+          queue.push(neighbor);
+        }
+      }
+
+      const componentWidth = maxX - minX + 1;
+      const componentHeight = maxY - minY + 1;
+      const isLikelyWatermarkRegion =
+        component.length >= minComponentSize &&
+        componentWidth >= minBoxWidth &&
+        componentHeight >= minBoxHeight;
+
+      if (!isLikelyWatermarkRegion) continue;
+
+      for (const pixelIndex of component) {
+        const px = pixelIndex * 4;
+        data[px] = 255;
+        data[px + 1] = 255;
+        data[px + 2] = 255;
       }
     }
 
