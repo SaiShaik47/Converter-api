@@ -840,14 +840,21 @@ async function removeLightWatermarkFromPdf(inputPdfPath, outputPdfPath, workDir)
       const r = data[px];
       const g = data[px + 1];
       const b = data[px + 2];
+      const alpha = data[px + 3];
       const brightness = (r + g + b) / 3;
       const spread = Math.max(r, g, b) - Math.min(r, g, b);
+      const likelyLightGrayWatermark =
+        alpha > 0 &&
+        spread < 20 &&
+        brightness >= 165 &&
+        brightness <= 245;
 
-      if (brightness > 160) {
+      // Only target the typical light-gray watermark band, so body text/tables stay intact.
+      if (likelyLightGrayWatermark) {
         data[px] = 255;
         data[px + 1] = 255;
         data[px + 2] = 255;
-      } else if (brightness < 145 && spread < 45) {
+      } else if (brightness < 100 && spread < 35) {
         data[px] = 0;
         data[px + 1] = 0;
         data[px + 2] = 0;
