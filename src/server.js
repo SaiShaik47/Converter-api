@@ -413,12 +413,18 @@ async function pdfToDocx(pdfPath, docxPath) {
 }
 
 async function extractDocxLines(inputPath) {
-  if (!(await commandAvailable("unzip"))) {
-    throw new Error("Fallback DOCX parser requires unzip command on the server.");
+  let xml = "";
+
+  if (await commandAvailable("unzip")) {
+    const { stdout } = await runCommand("unzip", ["-p", inputPath, "word/document.xml"]);
+    xml = String(stdout || "");
+  } else if (await commandAvailable("7z")) {
+    const { stdout } = await runCommand("7z", ["e", "-so", inputPath, "word/document.xml"]);
+    xml = String(stdout || "");
+  } else {
+    throw new Error("Fallback DOCX parser requires either unzip or 7z command on the server.");
   }
 
-  const { stdout } = await runCommand("unzip", ["-p", inputPath, "word/document.xml"]);
-  const xml = String(stdout || "");
   if (!xml.trim()) return [];
 
   const paragraphMatches = xml.match(/<w:p[\s\S]*?<\/w:p>/g) || [];
