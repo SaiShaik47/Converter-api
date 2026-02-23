@@ -579,7 +579,8 @@ async function libreOfficeConvert(inputPath, outDir, target, filter = "") {
   if (await commandAvailable("soffice")) {
     try {
       await runCommand("soffice", args);
-      for (let i = 0; i < 6; i += 1) {
+      const waitUntil = Date.now() + 15000;
+      while (Date.now() < waitUntil) {
         try {
           await fs.access(outPath);
           return outPath;
@@ -590,7 +591,7 @@ async function libreOfficeConvert(inputPath, outDir, target, filter = "") {
             .sort((a, b) => b.localeCompare(a))[0];
 
           if (convertedMatch) return path.join(outDir, convertedMatch);
-          if (i < 5) await new Promise(resolve => setTimeout(resolve, 200));
+          await new Promise(resolve => setTimeout(resolve, 250));
         }
       }
       throw new Error(`Converted .${target} file was not generated.`);
