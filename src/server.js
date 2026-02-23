@@ -353,6 +353,31 @@ async function writeTextPdf(lines, outputPath) {
   });
 }
 
+function parseBooleanFlag(value, fallback = false) {
+  if (typeof value === "boolean") return value;
+  if (typeof value !== "string") return fallback;
+  return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+}
+
+function parseDocxPdfOptions(source = {}) {
+  const margin = Number(source.margin);
+  const fontSize = Number(source.fontSize);
+  const lineGap = Number(source.lineGap);
+
+  return {
+    engine: String(source.engine || "auto").toLowerCase(),
+    title: typeof source.title === "string" ? source.title.trim() : "",
+    watermarkText: typeof source.watermarkText === "string" ? source.watermarkText.trim() : "",
+    watermarkPreset: typeof source.watermarkPreset === "string" ? source.watermarkPreset.trim() : "diag_rl",
+    watermarkSize: typeof source.watermarkSize === "string" ? source.watermarkSize.trim() : "medium",
+    password: typeof source.password === "string" ? source.password : "",
+    margin: Number.isFinite(margin) ? Math.min(Math.max(margin, 18), 96) : 42,
+    fontSize: Number.isFinite(fontSize) ? Math.min(Math.max(fontSize, 9), 24) : 11,
+    lineGap: Number.isFinite(lineGap) ? Math.min(Math.max(lineGap, 2), 14) : 5,
+    preservePageBreaks: parseBooleanFlag(source.preservePageBreaks, true)
+  };
+}
+
 async function createZip(filePaths, zipPath) {
   await new Promise((resolve, reject) => {
     const output = createWriteStream(zipPath);
@@ -371,9 +396,13 @@ async function createZip(filePaths, zipPath) {
 }
 
 async function pdfToDocx(pdfPath, docxPath) {
-  const raw = await fs.readFile(pdfPath);
-  const parsed = await pdfParse(raw);
-  const lines = (parsed.text || "").split(/\r?\n/);
+  const pages = await extractPdfPagesText(pdfPath);
+  const lines = pages.flatMap((page, index) => {
+    const normalizedLines = page.lines.length ? page.lines : [""];
+    if (index === pages.length - 1) return normalizedLines;
+    return [...normalizedLines, "", "──────── PAGE BREAK ────────", ""];
+  });
+
   const doc = new Document({
     sections: [
       { properties: {}, children: lines.map((line) => new Paragraph(line)) }
@@ -381,6 +410,161 @@ async function pdfToDocx(pdfPath, docxPath) {
   });
   const buffer = await Packer.toBuffer(doc);
   await fs.writeFile(docxPath, buffer);
+}
+
+async function extractDocxLines(inputPath) {
+  if (!(await commandAvailable("unzip"))) {
+    throw new Error("Fallback DOCX parser requires unzip command on the server.");
+  }
+
+  const { stdout } = await runCommand("unzip", ["-p", inputPath, "word/document.xml"]);
+  const xml = String(stdout || "");
+  if (!xml.trim()) return [];
+
+  const paragraphMatches = xml.match(/<w:p[\s\S]*?<\/w:p>/g) || [];
+  const lines = paragraphMatches.map((paragraphXml) => {
+    const withBreaks = paragraphXml.replace(/<w:br\s*\/?\s*>/g, "\n");
+    const withTabs = withBreaks.replace(/<w:tab\s*\/?\s*>/g, "\t");
+    const withoutTags = withTabs.replace(/<[^>]+>/g, "");
+    return withoutTags
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'")
+      .replace(/\r/g, "")
+      .trimEnd();
+  });
+
+  return lines;
+}
+
+async function extractPdfPagesText(pdfPath) {
+  try {
+    const data = new Uint8Array(await fs.readFile(pdfPath));
+    const loadingTask = pdfjsLib.getDocument({
+      data,
+      disableWorker: true,
+      standardFontDataUrl
+    });
+    const pdfDoc = await loadingTask.promise;
+    const pages = [];
+
+    for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum += 1) {
+      const page = await pdfDoc.getPage(pageNum);
+      const content = await page.getTextContent();
+      const lines = [];
+      let currentLine = [];
+      let currentY = null;
+
+      for (const item of content.items || []) {
+        const text = String(item.str || "").trim();
+        if (!text) continue;
+        const y = Number(item.transform?.[5] ?? 0);
+        if (currentY !== null && Math.abs(currentY - y) > 2.5) {
+          lines.push(currentLine.join(" "));
+          currentLine = [];
+        }
+        currentLine.push(text);
+        currentY = y;
+      }
+
+      if (currentLine.length) lines.push(currentLine.join(" "));
+      pages.push({ page: pageNum, lines: lines.filter(Boolean) });
+    }
+
+    return pages;
+  } catch {
+    const raw = await fs.readFile(pdfPath);
+    const parsed = await pdfParse(raw);
+    return [{ page: 1, lines: (parsed.text || "").split(/\r?\n/).map((line) => line.trimEnd()) }];
+  }
+}
+
+async function writeDocxFallbackPdf(inputPath, outPath, options = {}) {
+  const lines = await extractDocxLines(inputPath);
+
+  await new Promise((resolve, reject) => {
+    const doc = new PDFKitDocument({ margin: options.margin || 42, size: "A4" });
+    const stream = createWriteStream(outPath);
+
+    doc.on("error", reject);
+    stream.on("error", reject);
+    stream.on("finish", resolve);
+    doc.pipe(stream);
+
+    if (options.title) {
+      doc.fontSize(Math.max((options.fontSize || 11) + 4, 14)).text(options.title, { underline: true });
+      doc.moveDown(1);
+    }
+
+    const safeLines = lines.length ? lines : ["(Empty document)"];
+    for (const line of safeLines) {
+      if (line === "") {
+        doc.moveDown(0.5);
+        continue;
+      }
+      doc.fontSize(options.fontSize || 11).text(line, {
+        lineGap: options.lineGap || 5,
+        align: "left"
+      });
+      doc.moveDown(0.2);
+    }
+
+    doc.end();
+  });
+}
+
+async function applyPostPdfDecorations(inputPdfPath, outputPdfPath, options = {}) {
+  let currentPath = inputPdfPath;
+
+  if (options.watermarkText) {
+    const wmPath = `${outputPdfPath}.wm.pdf`;
+    await addTextWatermarkToPdf(currentPath, wmPath, options.watermarkText, options.watermarkPreset, options.watermarkSize);
+    currentPath = wmPath;
+  }
+
+  if (options.password) {
+    await protectPdf(currentPath, outputPdfPath, options.password);
+    if (currentPath !== inputPdfPath) await safeUnlink(currentPath);
+    return outputPdfPath;
+  }
+
+  if (currentPath !== outputPdfPath) {
+    await fs.copyFile(currentPath, outputPdfPath);
+    if (currentPath !== inputPdfPath) await safeUnlink(currentPath);
+  }
+
+  return outputPdfPath;
+}
+
+async function docxToPdfAdvanced(inputPath, outDir, userOptions = {}) {
+  const options = parseDocxPdfOptions(userOptions);
+  const base = path.parse(inputPath).name;
+  const outPath = path.join(outDir, `${base}.pdf`);
+
+  const shouldUseLibreOffice = options.engine === "auto" || options.engine === "soffice";
+  if (shouldUseLibreOffice && await commandAvailable("soffice")) {
+    try {
+      const converted = await libreOfficeConvert(inputPath, outDir, "pdf");
+      if (options.watermarkText || options.password) {
+        return applyPostPdfDecorations(converted, outPath, options);
+      }
+      return converted;
+    } catch {
+      if (options.engine === "soffice") throw new Error("DOCX to PDF via soffice failed for this file.");
+    }
+  }
+
+  if (options.engine === "soffice") {
+    throw new Error("soffice is not installed. Use engine=auto or engine=fallback.");
+  }
+
+  await writeDocxFallbackPdf(inputPath, outPath, options);
+  if (options.watermarkText || options.password) {
+    return applyPostPdfDecorations(outPath, outPath, options);
+  }
+  return outPath;
 }
 
 /**
@@ -1480,7 +1664,7 @@ app.get("/", (req, res) => {
       pdf_to_excel: "POST /pdf-to-excel?pages=all (form-data key: file)",
       pdf_to_txt: "POST /pdf-to-txt (form-data key: file)",
       txt_to_pdf: "POST /txt-to-pdf (form-data key: file)",
-      docx_to_pdf: "POST /docx-to-pdf (form-data key: file)",
+      docx_to_pdf: "POST /docx-to-pdf (form-data key: file, optional fields/query: engine=auto|soffice|fallback, title, watermarkText, watermarkPreset, watermarkSize, password, margin, fontSize, lineGap)",
       pdf_to_docx: "POST /pdf-to-docx (form-data key: file)",
       pptx_to_pdf: "POST /pptx-to-pdf (form-data key: file)",
       pdf_to_pptx: "POST /pdf-to-pptx (form-data key: file)",
@@ -1647,13 +1831,14 @@ app.post("/txt-to-pdf", upload.single("file"), async (req, res) => {
 });
 
 app.post("/docx-to-pdf", upload.single("file"), async (req, res) => {
+  const options = parseDocxPdfOptions({ ...req.query, ...req.body });
   await handleFileConversion(req, res, {
     allowedExts: [".docx"],
     invalidExtMessage: "Only .docx allowed",
     workPrefix: "d2p-",
     contentType: "application/pdf",
     outputName: "output.pdf",
-    convert: async (inputPath, workDir) => libreOfficeConvert(inputPath, workDir, "pdf")
+    convert: async (inputPath, workDir) => docxToPdfAdvanced(inputPath, workDir, options)
   });
 });
 
@@ -2557,7 +2742,7 @@ Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "
         return outPath;
       }}
     },
-    ".docx": { pdf: { label: "DOCX → PDF", outputExt: ".pdf", convert: (input, dir) => libreOfficeConvert(input, dir, "pdf") } },
+    ".docx": { pdf: { label: "DOCX → PDF", outputExt: ".pdf", convert: (input, dir, context = {}) => docxToPdfAdvanced(input, dir, context) } },
     ".pptx": { pdf: { label: "PPTX → PDF", outputExt: ".pdf", convert: (input, dir) => libreOfficeConvert(input, dir, "pdf") } },
     ".html": { pdf: { label: "HTML → PDF", outputExt: ".pdf", convert: (input, dir) => htmlToPdf(input, dir) } },
     ".htm": { pdf: { label: "HTML → PDF", outputExt: ".pdf", convert: (input, dir) => htmlToPdf(input, dir) } },
