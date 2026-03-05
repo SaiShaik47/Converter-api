@@ -2640,6 +2640,11 @@ function startTelegramBot() {
       return;
     }
 
+    if (existing?.status === "pending") {
+      await bot.sendMessage(msg.chat.id, "⏳ Your registration is already pending admin approval.");
+      return;
+    }
+
     db.users[key] = normalizeUserRecord(existing, msg.from);
     await saveUsersDb(db);
 
@@ -3151,7 +3156,7 @@ Use /users to view details.`;
 
     await bot.sendMessage(msg.chat.id, "👋 Welcome. To use this bot, send /register and wait for admin approval.");
   });
-  bot.onText(/\/register/, async (msg) => {
+  bot.onText(/^\/register(?:@\w+)?(?:\s|$)/, async (msg) => {
     if (isAdminUser(msg.from)) {
       await registerUserFlow(msg);
       await bot.sendMessage(msg.chat.id, getStartText(), { parse_mode: "Markdown" });
@@ -3898,6 +3903,42 @@ Send more or type /done`);
 
   bot.on("callback_query", async (query) => {
     const data = query.data || "";
+
+    if (data.startsWith("admin:")) {
+      if (!isAdminUser(query.from)) {
+        await bot.answerCallbackQuery(query.id, { text: "Admin only." });
+        return;
+      }
+
+      const [, action, userId] = data.split(":");
+      if (!userId) {
+        await bot.answerCallbackQuery(query.id, { text: "Invalid request." });
+        return;
+      }
+
+      let result;
+      if (action === "approve") {
+        const approvedBy = query.from?.username ? `@${query.from.username}` : String(query.from?.id || "admin");
+        result = await approveUser(userId, approvedBy);
+      } else if (action === "reject") {
+        result = await rejectUser(userId);
+      } else {
+        await bot.answerCallbackQuery(query.id, { text: "Unknown admin action." });
+        return;
+      }
+
+      if (!result?.ok) {
+        await bot.answerCallbackQuery(query.id, { text: result?.reason || "Failed." });
+        return;
+      }
+
+      const actionLabel = action === "approve" ? "approved" : "rejected";
+      await bot.answerCallbackQuery(query.id, { text: `User ${actionLabel}.` });
+      if (query.message?.chat?.id) {
+        await bot.sendMessage(query.message.chat.id, `${action === "approve" ? "✅" : "❌"} ${action === "approve" ? "Approved" : "Rejected"} ${userId}`);
+      }
+      return;
+    }
 
     const reg = await getUserRegistration(query.from || {});
     if (!isAdminUser(query.from) && reg?.status !== "approved" && !data.startsWith("admin:")) {
