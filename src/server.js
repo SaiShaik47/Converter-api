@@ -47,6 +47,7 @@ let telegramSendMaxMb = resolveLimitMb(process.env.TELEGRAM_MAX_MB, MAX_MB, TELE
 // Telegram hard limit for user -> bot uploads (cannot be increased by server/hosting)
 const TELEGRAM_INCOMING_MAX_MB = 25;
 const TELEGRAM_INCOMING_MAX_BYTES = TELEGRAM_INCOMING_MAX_MB * 1024 * 1024;
+const ACCESS_PROMPT_COOLDOWN_MS = 60 * 1000;
 const USERS_DB_PATH =
   process.env.USERS_DB_PATH ||
   path.join(process.cwd(), "data", "users.json");
@@ -89,9 +90,6 @@ async function saveUsersDb(db) {
   await fs.writeFile(USERS_DB_PATH, JSON.stringify(db, null, 2), "utf8");
 }
 
-function isPrivateChat(msg) {
-  return msg?.chat?.type === "private";
-}
 
 function normalizeUserRecord(existing, from) {
   const now = new Date().toISOString();
@@ -2567,15 +2565,22 @@ function startTelegramBot() {
     const reg = await getUserRegistration(msg.from);
     if (reg?.status === "approved") return true;
 
+    const notifyKey = `${msg.chat?.id || "chat"}:${msg.from.id}`;
+    const now = Date.now();
+    const lastNotifiedAt = ensureRegisteredOrAdmin.lastPromptByChat.get(notifyKey) || 0;
+    if (now - lastNotifiedAt < ACCESS_PROMPT_COOLDOWN_MS) return false;
+    ensureRegisteredOrAdmin.lastPromptByChat.set(notifyKey, now);
+
     const accessMessage = reg?.status === "rejected"
       ? "❌ Your registration was rejected. Contact admin for access."
       : reg?.status === "pending"
       ? "⏳ Your account is pending admin approval."
-      : "👋 To use this bot, send /register first.";
+      : "📝 You are not registered yet. Send /register to request admin approval.";
 
     await bot.sendMessage(msg.chat.id, accessMessage);
     return false;
   }
+  ensureRegisteredOrAdmin.lastPromptByChat = new Map();
 
   async function approveUser(userId, approvedBy) {
     const db = await loadUsersDb();
@@ -2622,14 +2627,6 @@ function startTelegramBot() {
   }
 
   async function registerUserFlow(msg) {
-    if (!isPrivateChat(msg)) {
-      await bot.sendMessage(
-        msg.chat.id,
-        "🔒 Registration must be done in private chat. Please open this bot in DM and send /register."
-      );
-      return;
-    }
-
     const db = await loadUsersDb();
     const key = String(msg.from.id);
     const existing = db.users[key];
@@ -2662,7 +2659,8 @@ function startTelegramBot() {
     const note = `🆕 Registration request
 ID: ${msg.from.id}
 User: ${msg.from.username ? `@${msg.from.username}` : "(no username)"}
-Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "Unknown"}`;
+Name: ${[msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "Unknown"}
+From: ${msg.chat?.type || "unknown"}${msg.chat?.title ? ` (${msg.chat.title})` : ""}`;
     await notifyAdmins(note, { reply_markup: buildApprovalKeyboard(msg.from.id) });
   }
 
@@ -3147,14 +3145,6 @@ Use /users to view details.`;
   ]);
 
   bot.onText(/\/start/, async (msg) => {
-    if (!isPrivateChat(msg)) {
-      await bot.sendMessage(
-        msg.chat.id,
-        "👋 Please start me in private chat first, then send /register for approval."
-      );
-      return;
-    }
-
     if (isAdminUser(msg.from)) {
       await registerUserFlow(msg);
       await bot.sendMessage(msg.chat.id, getStartText(), { parse_mode: "Markdown" });
