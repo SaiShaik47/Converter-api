@@ -89,6 +89,10 @@ async function saveUsersDb(db) {
   await fs.writeFile(USERS_DB_PATH, JSON.stringify(db, null, 2), "utf8");
 }
 
+function isPrivateChat(msg) {
+  return msg?.chat?.type === "private";
+}
+
 function normalizeUserRecord(existing, from) {
   const now = new Date().toISOString();
   return {
@@ -2618,7 +2622,13 @@ function startTelegramBot() {
   }
 
   async function registerUserFlow(msg) {
-    if (msg.chat.type !== "private") return;
+    if (!isPrivateChat(msg)) {
+      await bot.sendMessage(
+        msg.chat.id,
+        "🔒 Registration must be done in private chat. Please open this bot in DM and send /register."
+      );
+      return;
+    }
 
     const db = await loadUsersDb();
     const key = String(msg.from.id);
@@ -3137,6 +3147,14 @@ Use /users to view details.`;
   ]);
 
   bot.onText(/\/start/, async (msg) => {
+    if (!isPrivateChat(msg)) {
+      await bot.sendMessage(
+        msg.chat.id,
+        "👋 Please start me in private chat first, then send /register for approval."
+      );
+      return;
+    }
+
     if (isAdminUser(msg.from)) {
       await registerUserFlow(msg);
       await bot.sendMessage(msg.chat.id, getStartText(), { parse_mode: "Markdown" });
