@@ -77,9 +77,10 @@ async function loadUsersDb() {
   try {
     const db = JSON.parse(raw || "{}");
     if (!db.users || typeof db.users !== "object") db.users = {};
+    if (!db.settings || typeof db.settings !== "object") db.settings = {};
     return db;
   } catch {
-    const db = { users: {} };
+    const db = { users: {}, settings: {} };
     await fs.writeFile(USERS_DB_PATH, JSON.stringify(db, null, 2), "utf8");
     return db;
   }
@@ -112,6 +113,10 @@ function buildApprovalKeyboard(userId) {
       { text: "❌ Reject", callback_data: `admin:reject:${userId}` }
     ]]
   };
+}
+
+function isAutoRegisterEnabled(db) {
+  return Boolean(db?.settings?.autoRegisterEnabled);
 }
 
 // ===== ADMIN CHECK (FIX for: isAdminUser is not defined) =====
@@ -2630,6 +2635,7 @@ function startTelegramBot() {
     const db = await loadUsersDb();
     const key = String(msg.from.id);
     const existing = db.users[key];
+    const autoRegisterEnabled = isAutoRegisterEnabled(db);
 
     if (isAdminUser(msg.from)) {
       db.users[key] = {
@@ -2652,8 +2658,19 @@ function startTelegramBot() {
       return;
     }
 
-    db.users[key] = normalizeUserRecord(existing, msg.from);
+    db.users[key] = {
+      ...normalizeUserRecord(existing, msg.from),
+      status: autoRegisterEnabled ? "approved" : "pending",
+      approvedAt: autoRegisterEnabled ? new Date().toISOString() : null,
+      rejectedAt: null
+    };
     await saveUsersDb(db);
+
+    if (autoRegisterEnabled) {
+      await bot.sendMessage(msg.chat.id, "✅ Auto-register is ON. Your account is approved instantly.");
+      await bot.sendMessage(msg.chat.id, getStartText(), { parse_mode: "Markdown" });
+      return;
+    }
 
     await bot.sendMessage(msg.chat.id, "✨ Registration submitted. Wait for admin approval.");
     const note = `🆕 Registration request
@@ -3103,7 +3120,8 @@ From: ${msg.chat?.type || "unknown"}${msg.chat?.title ? ` (${msg.chat.title})` :
 /unlock - unlock PDF/ZIP with password
 /admin - admin panel
 /users - list registered users
-/setlimitmb <1-2048> - set Telegram file limit (admin)`; 
+/setlimitmb <1-2048> - set Telegram file limit (admin)
+/autoregister <on|off|status> - auto approve new registrations (admin)`; 
 
   async function adminUsersSummary() {
     const db = await loadUsersDb();
@@ -3117,7 +3135,8 @@ Users: ${users.length}
 ⏳ Pending: ${pending}
 ❌ Rejected: ${rejected}
 
-Use /users to view details.`;
+Use /users to view details.
+Use /autoregister status to check auto-approval mode.`;
   }
 
   bot.setMyCommands([
@@ -3141,7 +3160,8 @@ Use /users to view details.`;
     { command: "unlock", description: "Unlock a PDF/ZIP" },
     { command: "admin", description: "Admin panel" },
     { command: "users", description: "List users (admin)" },
-    { command: "setlimitmb", description: "Set Telegram file limit (admin)" }
+    { command: "setlimitmb", description: "Set Telegram file limit (admin)" },
+    { command: "autoregister", description: "Toggle auto-approve registrations (admin)" }
   ]);
 
   bot.onText(/\/start/, async (msg) => {
@@ -3208,6 +3228,26 @@ ${lines.join("\n")}` : "No registered users yet.");
       msg.chat.id,
       `✅ Telegram bot file limit updated to ${telegramSendMaxMb} MB.\nThis setting is runtime-only unless you also set TELEGRAM_MAX_MB env.`
     );
+  });
+  bot.onText(/\/autoregister(?:\s+(on|off|status))?(?:@\w+)?(?:\s|$)/i, async (msg, match) => {
+    if (!isAdminUser(msg.from)) return bot.sendMessage(msg.chat.id, "❌ Admin only command.");
+
+    const action = String(match?.[1] || "status").toLowerCase();
+    const db = await loadUsersDb();
+    const currentlyEnabled = isAutoRegisterEnabled(db);
+
+    if (action === "status") {
+      return bot.sendMessage(msg.chat.id, `ℹ️ Auto-register is currently *${currentlyEnabled ? "ON" : "OFF"}*.`, { parse_mode: "Markdown" });
+    }
+
+    if (action !== "on" && action !== "off") {
+      return bot.sendMessage(msg.chat.id, "❌ Usage: /autoregister <on|off|status>");
+    }
+
+    const enabled = action === "on";
+    db.settings = { ...(db.settings || {}), autoRegisterEnabled: enabled };
+    await saveUsersDb(db);
+    await bot.sendMessage(msg.chat.id, `✅ Auto-register is now *${enabled ? "ON" : "OFF"}*.`, { parse_mode: "Markdown" });
   });
   bot.onText(/\/approve\s+(\d+)/, async (msg, match) => {
     if (!isAdminUser(msg.from)) return bot.sendMessage(msg.chat.id, "❌ Admin only command.");
